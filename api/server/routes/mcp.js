@@ -640,6 +640,44 @@ router.post('/oauth/cancel/:serverName', requireJwtAuth, async (req, res) => {
 });
 
 /**
+ * Records a user's response to an MCP elicitation prompt, completing the pending flow so the
+ * blocked tool call resumes. Flow ids are prefixed with the user id; we enforce that here so a
+ * user can only answer their own prompts.
+ */
+router.post('/elicitation/:flowId/respond', requireJwtAuth, async (req, res) => {
+  try {
+    const { flowId } = req.params;
+    const { action, content } = req.body ?? {};
+    const user = req.user;
+
+    if (!user?.id) {
+      return res.status(401).json({ error: 'User not authenticated' });
+    }
+    if (!['accept', 'decline', 'cancel'].includes(action)) {
+      return res.status(400).json({ error: 'Invalid action; expected accept | decline | cancel' });
+    }
+    if (!flowId.startsWith(`${user.id}:`)) {
+      return res.status(403).json({ error: 'Not authorized for this elicitation' });
+    }
+
+    const flowsCache = getLogStores(CacheKeys.FLOWS);
+    const flowManager = getFlowStateManager(flowsCache);
+    const completed = await flowManager.completeFlow(flowId, 'mcp_elicitation', {
+      action,
+      ...(content != null ? { content } : {}),
+    });
+
+    if (!completed) {
+      return res.status(404).json({ error: 'Elicitation flow not found or already completed' });
+    }
+    res.json({ success: true });
+  } catch (error) {
+    logger.error('[MCP Elicitation] Failed to record elicitation response', error);
+    res.status(500).json({ error: 'Failed to record elicitation response' });
+  }
+});
+
+/**
  * Reinitialize MCP server
  * This endpoint allows reinitializing a specific MCP server
  */

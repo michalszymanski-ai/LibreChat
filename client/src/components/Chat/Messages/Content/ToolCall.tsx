@@ -27,6 +27,7 @@ export default function ToolCall({
   output,
   attachments,
   auth,
+  elicitation,
   hideAttachments = false,
   onExpand,
 }: {
@@ -38,6 +39,12 @@ export default function ToolCall({
   output?: string | null;
   attachments?: TAttachment[];
   auth?: string;
+  elicitation?: {
+    flowId: string;
+    message: string;
+    choices?: Array<{ value: string; label: string }>;
+    expires_at?: number;
+  };
   hideAttachments?: boolean;
   onExpand?: () => void;
 }) {
@@ -133,6 +140,23 @@ export default function ToolCall({
     }
     window.open(auth, '_blank', 'noopener,noreferrer');
   }, [auth, isMCPToolCall, mcpServerName, actionId]);
+
+  const [elicitationResponded, setElicitationResponded] = useState(false);
+  const respondElicitation = useCallback(
+    async (action: 'accept' | 'decline' | 'cancel', content?: Record<string, unknown>) => {
+      if (!elicitation?.flowId) {
+        return;
+      }
+      setElicitationResponded(true);
+      try {
+        await dataService.respondMCPElicitation(elicitation.flowId, { action, content });
+      } catch (e) {
+        logger.error('Failed to respond to MCP elicitation', e);
+        setElicitationResponded(false);
+      }
+    },
+    [elicitation?.flowId],
+  );
 
   const hasError = typeof output === 'string' && isError(output);
   const cancelled = !isSubmitting && initialProgress < 1 && !hasError;
@@ -268,6 +292,41 @@ export default function ToolCall({
           </p>
         </div>
       )}
+      {elicitation?.flowId != null &&
+        progress < 1 &&
+        !showCancelled &&
+        !elicitationResponded && (
+          <div className="my-2 flex w-full flex-col gap-2.5">
+            {elicitation.message && (
+              <p className="text-sm text-text-primary">{elicitation.message}</p>
+            )}
+            {elicitation.choices && elicitation.choices.length > 0 ? (
+              <div className="flex flex-wrap gap-2">
+                {elicitation.choices.map((choice) => (
+                  <Button
+                    key={choice.value}
+                    variant="default"
+                    onClick={() => respondElicitation('accept', { value: choice.value })}
+                  >
+                    {choice.label}
+                  </Button>
+                ))}
+                <Button variant="outline" onClick={() => respondElicitation('decline')}>
+                  {localize('com_ui_elicitation_decline')}
+                </Button>
+              </div>
+            ) : (
+              <div className="flex gap-2">
+                <Button variant="default" onClick={() => respondElicitation('accept')}>
+                  {localize('com_ui_elicitation_confirm')}
+                </Button>
+                <Button variant="outline" onClick={() => respondElicitation('decline')}>
+                  {localize('com_ui_elicitation_decline')}
+                </Button>
+              </div>
+            )}
+          </div>
+        )}
       {!hideAttachments && attachments && attachments.length > 0 && (
         <AttachmentGroup attachments={attachments} />
       )}

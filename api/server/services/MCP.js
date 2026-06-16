@@ -17,6 +17,8 @@ const {
   buildMCPAuthRunStepEvent,
   buildMCPAuthRunStepDeltaEvent,
   buildMCPAuthRunStepEndDeltaEvent,
+  buildMCPElicitationRunStepDeltaEvent,
+  buildMCPElicitationEndDeltaEvent,
   isUserSourced,
   checkAccessWithRequestCache,
   requiresEphemeralUserConnection,
@@ -808,6 +810,39 @@ function createToolInstance({
         streamId,
       });
 
+      // Elicitation: surface a server-requested confirm/choice prompt on this tool call and
+      // block (via a flow) until the user responds through the elicitation respond endpoint.
+      const elicitationFlowId = `${userId}:${serverName}:elicitation:${config.metadata.thread_id}:${config.metadata.run_id}:${stepId}`;
+      const emitElicitationEvent = async (eventData) => {
+        if (streamId) {
+          await GenerationJobManager.emitChunk(streamId, eventData);
+        } else {
+          sendEvent(res, eventData);
+        }
+      };
+      const elicitation = {
+        flowId: elicitationFlowId,
+        emit: async ({ flowId, message, choices, expiresAt }) => {
+          await emitElicitationEvent(
+            buildMCPElicitationRunStepDeltaEvent({
+              stepId,
+              toolCall,
+              flowId,
+              message,
+              choices,
+              expiresAt,
+            }),
+          );
+        },
+        resolve: async (flowId, signal) => {
+          try {
+            return await flowManager.createFlow(flowId, 'mcp_elicitation', {}, signal);
+          } finally {
+            await emitElicitationEvent(buildMCPElicitationEndDeltaEvent({ stepId, toolCall }));
+          }
+        },
+      };
+
       if (derivedSignal) {
         const tenantId = config?.configurable?.user?.tenantId ?? getTenantId();
         abortHandler = createAbortHandler({ userId, serverName, toolName, tenantId, flowManager });
@@ -840,6 +875,7 @@ function createToolInstance({
         },
         oauthStart,
         oauthEnd,
+        elicitation,
         graphTokenResolver: getGraphApiToken,
         oboTokenResolver: exchangeOboToken,
         oboTrustChecker: createOboTrustChecker(),

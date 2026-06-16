@@ -289,6 +289,7 @@ const Part = memo(function Part({
           isSubmitting={isSubmitting}
           attachments={attachments}
           auth={toolCall.auth}
+          elicitation={toolCall.elicitation}
           isLast={isLast}
           hideAttachments={hideAttachments}
           onExpand={onToolExpand}

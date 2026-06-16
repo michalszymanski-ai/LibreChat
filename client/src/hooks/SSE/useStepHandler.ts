@@ -863,6 +863,9 @@ export default function useStepHandler({
               contentPart.tool_call.expires_at = runStepDelta.delta.expires_at;
             }
 
+            // Pending elicitation prompt for this tool call; cleared when the delta omits it.
+            contentPart.tool_call.elicitation = runStepDelta.delta.elicitation;
+
             // Use server's index, offset by initialContent for edit scenarios
             const currentIndex = runStep.index + initialContent.length;
             updatedResponse = updateContent(

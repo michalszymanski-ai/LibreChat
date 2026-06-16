@@ -28,6 +28,7 @@ import { MCPConnectionFactory } from './MCPConnectionFactory';
 import { preProcessGraphTokens } from '~/utils/graph';
 import { formatToolContent } from './parsers';
 import { MCPConnection } from './connection';
+import type { MCPElicitationContext } from './connection';
 import { processMCPEnv } from '~/utils/env';
 
 function createOboToolCallErrorMessage(
@@ -354,6 +355,7 @@ Please follow these instructions when using tools from the respective MCP server
     flowManager,
     oauthStart,
     oauthEnd,
+    elicitation,
     customUserVars,
     graphTokenResolver,
     oboTokenResolver,
@@ -374,6 +376,8 @@ Please follow these instructions when using tools from the respective MCP server
     flowManager: FlowStateManager<MCPOAuthTokens | null>;
     oauthStart?: t.OAuthStartHandler;
     oauthEnd?: () => Promise<void>;
+    /** Surfaces MCP elicitation prompts to the client and blocks until the user responds. */
+    elicitation?: MCPElicitationContext;
     graphTokenResolver?: GraphTokenResolver;
     oboTokenResolver?: OboTokenResolver;
     oboTrustChecker?: OboTrustChecker;
@@ -512,6 +516,10 @@ Please follow these instructions when using tools from the respective MCP server
 
       connection.setRequestHeaders(resolvedHeaders);
 
+      if (elicitation) {
+        connection.elicitationContext = { ...elicitation, signal: options?.signal };
+      }
+
       const result = await connection.client.request(
         {
           method: 'tools/call',
@@ -539,6 +547,9 @@ Please follow these instructions when using tools from the respective MCP server
       throw error;
     } finally {
       cleanupRequestOAuthHandler?.();
+      if (connection) {
+        connection.elicitationContext = undefined;
+      }
       // Ephemeral connections are never stored in userConnections, so disconnecting
       // is the only cleanup needed; removing the map entry here could orphan a
       // still-connected cached connection from before a config change.

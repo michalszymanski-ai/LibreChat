@@ -5,7 +5,7 @@ import { fetch as undiciFetch, Agent, ProxyAgent } from 'undici';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 import { WebSocketClientTransport } from '@modelcontextprotocol/sdk/client/websocket.js';
-import { ResourceListChangedNotificationSchema } from '@modelcontextprotocol/sdk/types.js';
+import { ElicitRequestSchema, ResourceListChangedNotificationSchema } from '@modelcontextprotocol/sdk/types.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import {
   StdioClientTransport,
@@ -18,8 +18,54 @@ import type {
   Dispatcher,
 } from 'undici';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
+import type { ElicitRequest, ElicitResult } from '@modelcontextprotocol/sdk/types.js';
 import type { MCPOAuthTokens } from './oauth/types';
 import type * as t from './types';
+
+/** Choice presented to the user in choice-mode elicitation. */
+export type ElicitationChoice = { value: string; label: string };
+
+/**
+ * Per-tool-call context that lets the connection surface an MCP elicitation prompt to the
+ * client and block until the user responds. Set by `MCPManager.callTool` for the duration of
+ * a `tools/call`, then cleared.
+ */
+export interface MCPElicitationContext {
+  flowId: string;
+  signal?: AbortSignal;
+  /** Push the prompt to the chat UI (mirrors the OAuth prompt event). */
+  emit: (payload: {
+    flowId: string;
+    message: string;
+    choices?: ElicitationChoice[];
+    expiresAt?: number;
+  }) => void | Promise<void>;
+  /** Block until the user responds via the elicitation respond endpoint. */
+  resolve: (
+    flowId: string,
+    signal?: AbortSignal,
+  ) => Promise<{ action: 'accept' | 'decline' | 'cancel'; content?: Record<string, unknown> }>;
+}
+
+/** Maps a single-enum requestedSchema into choice buttons; otherwise a plain confirm. */
+function deriveElicitationChoices(
+  requestedSchema: ElicitRequest['params']['requestedSchema'],
+): ElicitationChoice[] | undefined {
+  const properties = requestedSchema?.properties ?? {};
+  const keys = Object.keys(properties);
+  if (keys.length !== 1) {
+    return undefined;
+  }
+  const prop = properties[keys[0]] as {
+    type?: string;
+    enum?: string[];
+    enumNames?: string[];
+  };
+  if (prop?.type !== 'string' || !Array.isArray(prop.enum)) {
+    return undefined;
+  }
+  return prop.enum.map((value, i) => ({ value, label: prop.enumNames?.[i] ?? value }));
+}
 import { createSSRFSafeUndiciConnect, isSSRFTarget, resolveHostnameSSRF } from '~/auth';
 import { runOutsideTracing } from '~/utils/tracing';
 import { isAddressAllowed } from '~/auth/domain';
@@ -1250,12 +1296,50 @@ export class MCPConnection extends EventEmitter {
         version: '1.2.3',
       },
       {
-        capabilities: {},
+        capabilities: { elicitation: {} },
       },
     );
 
     this.setupEventListeners();
+    this.registerElicitationHandler();
   }
+
+  /**
+   * Handles server-initiated `elicitation/create` requests during a tool call: surfaces the
+   * prompt to the chat UI and blocks until the user responds. Without an active per-call
+   * context (no UI to prompt), it declines so the server can proceed safely.
+   */
+  private registerElicitationHandler(): void {
+    this.client.setRequestHandler(ElicitRequestSchema, async (request): Promise<ElicitResult> => {
+      const context = this.elicitationContext;
+      if (!context) {
+        return { action: 'decline' };
+      }
+      if (request.params.mode === 'url') {
+        // URL-mode elicitation is not supported yet.
+        return { action: 'decline' };
+      }
+      const choices = deriveElicitationChoices(request.params.requestedSchema);
+      try {
+        await context.emit({
+          flowId: context.flowId,
+          message: request.params.message,
+          choices,
+          expiresAt: Date.now() + mcpConfig.OAUTH_HANDLING_TIMEOUT,
+        });
+        const result = await context.resolve(context.flowId, context.signal);
+        return result.content != null
+          ? { action: result.action, content: result.content }
+          : { action: result.action };
+      } catch (error) {
+        logger.warn(`${this.getLogPrefix()} Elicitation failed: ${(error as Error).message}`);
+        return { action: 'cancel' };
+      }
+    });
+  }
+
+  /** Per-tool-call elicitation context; set by MCPManager.callTool around a `tools/call`. */
+  public elicitationContext?: MCPElicitationContext;
 
   /** Helper to generate consistent log prefixes */
   private getLogPrefix(): string {

@@ -62,6 +62,27 @@ export namespace Agents {
 
   export type MessageContent = string | MessageContentComplex[];
 
+  /** A single choice presented in a choice-mode elicitation. */
+  export type ElicitationChoice = {
+    value: string;
+    label: string;
+  };
+
+  /**
+   * An MCP elicitation prompt surfaced on a tool call: the server is asking the user to
+   * confirm (or pick an option) before the tool continues.
+   */
+  export type Elicitation = {
+    /** Flow id to respond to via POST /api/mcp/elicitation/:flowId/respond */
+    flowId: string;
+    /** Prompt message to show the user */
+    message: string;
+    /** Optional choices (choice mode); when absent, render a simple confirm/decline */
+    choices?: ElicitationChoice[];
+    /** Expiration time (ms epoch) after which the prompt is stale */
+    expires_at?: number;
+  };
+
   /**
    * A call to a tool.
    */
@@ -83,6 +104,8 @@ export namespace Agents {
     auth?: string;
     /** Expiration time */
     expires_at?: number;
+    /** Pending MCP elicitation prompt (confirm/choice) for this tool call */
+    elicitation?: Elicitation;
   };
 
   export type ToolEndEvent = {
@@ -262,6 +285,7 @@ export namespace Agents {
     tool_calls?: ToolCallChunk[];
     auth?: string;
     expires_at?: number;
+    elicitation?: Elicitation;
   };
   export type AgentToolCall = FunctionToolCall | ToolCall;
   export interface ExtendedMessageContent {

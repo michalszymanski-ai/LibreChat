@@ -203,6 +203,15 @@ export const bindMCPOAuth = (serverName: string): Promise<{ success: boolean }> 
   return request.post(endpoints.mcpOAuthBind(serverName));
 };
 
+export type MCPElicitationAction = 'accept' | 'decline' | 'cancel';
+
+export const respondMCPElicitation = (
+  flowId: string,
+  body: { action: MCPElicitationAction; content?: Record<string, unknown> },
+): Promise<{ success: boolean }> => {
+  return request.post(endpoints.mcpElicitationRespond(flowId), body);
+};
+
 export const bindActionOAuth = (actionId: string): Promise<{ success: boolean }> => {
   return request.post(endpoints.actionOAuthBind(actionId));
 };
