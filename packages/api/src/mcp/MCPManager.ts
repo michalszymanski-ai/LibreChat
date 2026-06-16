@@ -5,6 +5,7 @@ import { CallToolResultSchema, ErrorCode, McpError } from '@modelcontextprotocol
 import type { RequestOptions } from '@modelcontextprotocol/sdk/shared/protocol.js';
 import type { TokenMethods, IUser } from '@librechat/data-schemas';
 import type { OboTokenResolver, OboTrustChecker } from '~/mcp/oauth/obo';
+import type { MCPElicitationContext } from './connection';
 import type { GraphTokenResolver } from '~/utils/graph';
 import type { FlowStateManager } from '~/flow/manager';
 import type { MCPOAuthTokens } from './oauth';
@@ -28,7 +29,6 @@ import { MCPConnectionFactory } from './MCPConnectionFactory';
 import { preProcessGraphTokens } from '~/utils/graph';
 import { formatToolContent } from './parsers';
 import { MCPConnection } from './connection';
-import type { MCPElicitationContext } from './connection';
 import { processMCPEnv } from '~/utils/env';
 
 function createOboToolCallErrorMessage(

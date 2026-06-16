@@ -22,6 +22,7 @@ import {
   BashCall,
   SubagentCall,
 } from './Parts';
+import { isBashProgrammaticToolCall } from './routing';
 import { ErrorMessage } from './MessageContent';
 import RetrievalCall from './RetrievalCall';
 import { getCachedPreview } from '~/utils';
@@ -31,7 +32,6 @@ import Container from './Container';
 import WebSearch from './WebSearch';
 import ToolCall from './ToolCall';
 import Image from './Image';
-import { isBashProgrammaticToolCall } from './routing';
 
 type PartProps = {
   part?: TMessageContentParts;

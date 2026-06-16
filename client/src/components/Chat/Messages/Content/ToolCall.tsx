@@ -292,41 +292,38 @@ export default function ToolCall({
           </p>
         </div>
       )}
-      {elicitation?.flowId != null &&
-        progress < 1 &&
-        !showCancelled &&
-        !elicitationResponded && (
-          <div className="my-2 flex w-full flex-col gap-2.5">
-            {elicitation.message && (
-              <p className="text-sm text-text-primary">{elicitation.message}</p>
-            )}
-            {elicitation.choices && elicitation.choices.length > 0 ? (
-              <div className="flex flex-wrap gap-2">
-                {elicitation.choices.map((choice) => (
-                  <Button
-                    key={choice.value}
-                    variant="default"
-                    onClick={() => respondElicitation('accept', { value: choice.value })}
-                  >
-                    {choice.label}
-                  </Button>
-                ))}
-                <Button variant="outline" onClick={() => respondElicitation('decline')}>
-                  {localize('com_ui_elicitation_decline')}
+      {elicitation?.flowId != null && progress < 1 && !showCancelled && !elicitationResponded && (
+        <div className="my-2 flex w-full flex-col gap-2.5">
+          {elicitation.message && (
+            <p className="text-sm text-text-primary">{elicitation.message}</p>
+          )}
+          {elicitation.choices && elicitation.choices.length > 0 ? (
+            <div className="flex flex-wrap gap-2">
+              {elicitation.choices.map((choice) => (
+                <Button
+                  key={choice.value}
+                  variant="default"
+                  onClick={() => respondElicitation('accept', { value: choice.value })}
+                >
+                  {choice.label}
                 </Button>
-              </div>
-            ) : (
-              <div className="flex gap-2">
-                <Button variant="default" onClick={() => respondElicitation('accept')}>
-                  {localize('com_ui_elicitation_confirm')}
-                </Button>
-                <Button variant="outline" onClick={() => respondElicitation('decline')}>
-                  {localize('com_ui_elicitation_decline')}
-                </Button>
-              </div>
-            )}
-          </div>
-        )}
+              ))}
+              <Button variant="outline" onClick={() => respondElicitation('decline')}>
+                {localize('com_ui_elicitation_decline')}
+              </Button>
+            </div>
+          ) : (
+            <div className="flex gap-2">
+              <Button variant="default" onClick={() => respondElicitation('accept')}>
+                {localize('com_ui_elicitation_confirm')}
+              </Button>
+              <Button variant="outline" onClick={() => respondElicitation('decline')}>
+                {localize('com_ui_elicitation_decline')}
+              </Button>
+            </div>
+          )}
+        </div>
+      )}
       {!hideAttachments && attachments && attachments.length > 0 && (
         <AttachmentGroup attachments={attachments} />
       )}
