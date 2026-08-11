@@ -163,6 +163,26 @@ describe('MCPServersRegistry', () => {
     });
   });
 
+  describe('isAppServerConfig', () => {
+    it('rejects a same-name tenant override that inherited the YAML source tag', async () => {
+      const baseConfig = {
+        ...testParsedConfig,
+        source: 'yaml' as const,
+        url: 'https://base.example.com/mcp',
+        type: 'streamable-http' as const,
+      };
+      await registry['cacheConfigsRepo'].add('shared', baseConfig);
+
+      await expect(registry.isAppServerConfig('shared', baseConfig)).resolves.toBe(true);
+      await expect(
+        registry.isAppServerConfig('shared', {
+          ...baseConfig,
+          url: 'https://tenant.example.com/mcp',
+        }),
+      ).resolves.toBe(false);
+    });
+  });
+
   describe('addServer', () => {
     it('should pass user source to inspector before storing DB servers', async () => {
       const inspectSpy = jest.spyOn(MCPServerInspector, 'inspect');
@@ -220,6 +240,114 @@ describe('MCPServersRegistry', () => {
     });
   });
 
+  describe('resolveAllowlists (per-request, tenant-scoped)', () => {
+    const createWith = (
+      allowedDomains?: string[] | null,
+      allowedAddresses?: string[] | null,
+      resolver?: (ctx?: { userId?: string; role?: string }) => Promise<{
+        allowedDomains?: string[] | null;
+        allowedAddresses?: string[] | null;
+      }>,
+    ): MCPServersRegistry => {
+      (MCPServersRegistry as unknown as { instance: undefined }).instance = undefined;
+      MCPServersRegistry.createInstance(mockMongoose, allowedDomains, allowedAddresses, resolver);
+      return MCPServersRegistry.getInstance();
+    };
+
+    it('returns the YAML base allowlists when no resolver is injected', async () => {
+      const reg = createWith(['yaml.com'], ['10.0.0.0/8']);
+      await expect(reg.resolveAllowlists()).resolves.toEqual({
+        allowedDomains: ['yaml.com'],
+        allowedAddresses: ['10.0.0.0/8'],
+        useSSRFProtection: false,
+      });
+    });
+
+    it('enables SSRF protection when the effective allowlist is empty', async () => {
+      const reg = createWith(undefined, undefined);
+      await expect(reg.resolveAllowlists()).resolves.toEqual({
+        allowedDomains: undefined,
+        allowedAddresses: undefined,
+        useSSRFProtection: true,
+      });
+    });
+
+    it('returns the resolver-provided merged allowlists and forwards the context', async () => {
+      const resolver = jest.fn().mockResolvedValue({
+        allowedDomains: ['admin-added.com'],
+        allowedAddresses: ['172.16.0.0/12'],
+      });
+      const reg = createWith(['yaml.com'], null, resolver);
+
+      const result = await reg.resolveAllowlists({ userId: 'u1', role: 'ADMIN' });
+
+      expect(resolver).toHaveBeenCalledWith({ userId: 'u1', role: 'ADMIN' });
+      expect(result).toEqual({
+        allowedDomains: ['admin-added.com'],
+        allowedAddresses: ['172.16.0.0/12'],
+        useSSRFProtection: false,
+      });
+    });
+
+    it('falls back to the YAML base allowlists when the resolver throws', async () => {
+      const resolver = jest.fn().mockRejectedValue(new Error('DB down'));
+      const reg = createWith(['yaml.com'], null, resolver);
+
+      await expect(reg.resolveAllowlists()).resolves.toEqual({
+        allowedDomains: ['yaml.com'],
+        allowedAddresses: null,
+        useSSRFProtection: false,
+      });
+    });
+
+    it('inspects against the resolved (admin-panel) allowlist, not the YAML base', async () => {
+      const resolver = jest.fn().mockResolvedValue({
+        allowedDomains: ['admin-added.com'],
+        allowedAddresses: ['10.0.0.0/8'],
+      });
+      const reg = createWith(['yaml-only.com'], null, resolver);
+      const inspectSpy = jest.spyOn(MCPServerInspector, 'inspect');
+      await reg.reset();
+
+      await reg.addServer(
+        'admin_panel_server',
+        { type: 'streamable-http', url: 'https://admin-added.com/mcp' },
+        'DB',
+        'user-1',
+      );
+
+      expect(resolver).toHaveBeenCalledWith({ userId: 'user-1' });
+      expect(inspectSpy).toHaveBeenCalledWith(
+        'admin_panel_server',
+        expect.objectContaining({ url: 'https://admin-added.com/mcp' }),
+        undefined,
+        ['admin-added.com'],
+        ['10.0.0.0/8'],
+      );
+    });
+
+    it('scopes the config-source cache key by the resolved allowlist (no cross-tenant poison)', async () => {
+      const resolver = jest
+        .fn()
+        .mockResolvedValueOnce({ allowedDomains: ['a.com'], allowedAddresses: null })
+        .mockResolvedValueOnce({ allowedDomains: ['b.com'], allowedAddresses: null });
+      const reg = createWith(null, null, resolver);
+      const inspectSpy = jest.spyOn(MCPServerInspector, 'inspect');
+      await reg.reset();
+      inspectSpy.mockClear();
+
+      const cfg = {
+        srv: { type: 'streamable-http' as const, url: 'https://srv.example.com/mcp' },
+      };
+      await reg.ensureConfigServers(cfg); // resolver call 1 → allowlist A
+      await reg.ensureConfigServers(cfg); // resolver call 2 → allowlist B (distinct key)
+
+      // Different resolved allowlists ⇒ different cache keys ⇒ the second pass re-inspects
+      // instead of reusing the first allowlist's cached entry.
+      expect(inspectSpy).toHaveBeenCalledTimes(2);
+    });
+  });
+
   describe('reset', () => {
     it('should clear all servers from cache repository', async () => {
       // Add servers to cache using the new API
@@ -273,6 +401,29 @@ describe('MCPServersRegistry', () => {
         if (config && 'command' in config) {
           expect(config.command).toBe('python');
         }
+      });
+
+      it('separates update inspection from persistence', async () => {
+        await registry.addServer('cache_server', testParsedConfig, 'CACHE');
+        const updatedConfig = { ...testParsedConfig, command: 'python' } as t.ParsedServerConfig;
+
+        const inspected = await registry.inspectServerUpdate(
+          'cache_server',
+          updatedConfig,
+          'CACHE',
+        );
+
+        const beforeCommit = await registry['cacheConfigsRepo'].get('cache_server');
+        expect(beforeCommit && 'command' in beforeCommit ? beforeCommit.command : undefined).toBe(
+          'node',
+        );
+
+        await registry.commitServerUpdate('cache_server', inspected, 'CACHE');
+
+        const afterCommit = await registry['cacheConfigsRepo'].get('cache_server');
+        expect(afterCommit && 'command' in afterCommit ? afterCommit.command : undefined).toBe(
+          'python',
+        );
       });
 
       it('should route removeServer to cache repository', async () => {

@@ -1,6 +1,30 @@
+const mockCreateRun = jest.fn();
+const mockCaptureAgentCheckpointGeneration = jest.fn();
+const mockDeleteAgentCheckpoint = jest.fn();
+const mockIsHITLEnabled = jest.fn().mockReturnValue(false);
+const mockBuildAgentScopedContext = jest.fn((...args) =>
+  jest.requireActual('@librechat/api').buildAgentScopedContext(...args),
+);
+const mockFormatAgentMessages = jest.fn(() => ({
+  messages: [],
+  indexTokenCountMap: {},
+  summary: undefined,
+  boundaryTokenAdjustment: undefined,
+}));
+
 const { Providers } = require('@librechat/agents');
 const { Constants, ContentTypes, EModelEndpoint } = require('librechat-data-provider');
+const { GenerationJobManager, createStreamServices } = require('@librechat/api');
 const AgentClient = require('./client');
+const { resolveConfigServers } = require('~/server/services/MCP');
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
 
 jest.mock('@librechat/agents', () => ({
   ...jest.requireActual('@librechat/agents'),
@@ -8,14 +32,22 @@ jest.mock('@librechat/agents', () => ({
     handleLLMEnd: jest.fn(),
     collected: [],
   }),
+  formatAgentMessages: (...args) => mockFormatAgentMessages(...args),
 }));
 
 jest.mock('@librechat/api', () => ({
   ...jest.requireActual('@librechat/api'),
+  buildAgentScopedContext: (...args) => mockBuildAgentScopedContext(...args),
   checkAccess: jest.fn(),
+  createRun: (...args) => mockCreateRun(...args),
   countFormattedMessageTokens: jest.fn(() => 42),
   countTokens: jest.fn((text) => Math.ceil(String(text ?? '').length / 4)),
+  createTokenCounter: jest.fn(() => jest.fn(() => 0)),
+  captureAgentCheckpointGeneration: (...args) => mockCaptureAgentCheckpointGeneration(...args),
+  deleteAgentCheckpoint: (...args) => mockDeleteAgentCheckpoint(...args),
+  decrementPendingRequest: jest.fn(async () => {}),
   initializeAgent: jest.fn(),
+  isHITLEnabled: (...args) => mockIsHITLEnabled(...args),
   createMemoryProcessor: jest.fn(),
   isMemoryAgentEnabled: jest.fn((config) => {
     if (!config || config.disabled === true) return false;
@@ -24,7 +56,65 @@ jest.mock('@librechat/api', () => ({
     return Boolean(agent.id || (agent.provider && agent.model));
   }),
   loadAgent: jest.fn(),
+  maybePrewarmCodeSandbox: jest.fn(),
 }));
+
+describe('AgentClient - interrupt discovery persistence', () => {
+  beforeEach(async () => {
+    await GenerationJobManager.destroy();
+    GenerationJobManager.configure({ ...createStreamServices(), cleanupOnComplete: false });
+    GenerationJobManager.initialize();
+  });
+
+  afterEach(async () => {
+    await GenerationJobManager.destroy();
+  });
+
+  it('makes the run discovery snapshot durable when the run pauses', async () => {
+    const streamId = 'conversation-discovered-pause';
+    const job = await GenerationJobManager.createJob(streamId, 'user-123', streamId);
+    const client = new AgentClient({
+      req: {
+        user: { id: 'user-123' },
+        body: { endpoint: EModelEndpoint.agents, agent_id: 'agent-123' },
+        config: { endpoints: { [EModelEndpoint.agents]: {} } },
+      },
+      res: {},
+      agent: {
+        id: 'agent-123',
+        endpoint: EModelEndpoint.openAI,
+        provider: EModelEndpoint.openAI,
+        model_parameters: { model: 'gpt-4' },
+      },
+      contentParts: [],
+      collectedUsage: [],
+      artifactPromises: [],
+    });
+    client.conversationId = streamId;
+    client.responseMessageId = 'response-discovered-pause';
+    client.jobCreatedAt = job.createdAt;
+
+    await client.handleRunInterrupt(
+      {
+        getInterrupt: () => ({
+          interruptId: 'ask-interrupt',
+          threadId: streamId,
+          payload: {
+            type: 'ask_user_question',
+            question: { question: 'Proceed?' },
+          },
+        }),
+        getDiscoveredTools: () => ['save_issue_mcp_linear'],
+        getRunMessages: () => [],
+      },
+      streamId,
+    );
+
+    const paused = await GenerationJobManager.getJob(streamId);
+    expect(paused?.status).toBe('requires_action');
+    expect(paused?.metadata.discoveredTools).toEqual(['save_issue_mcp_linear']);
+  });
+});
 
 jest.mock('~/server/services/Config', () => ({
   getMCPServerTools: jest.fn(),
@@ -47,6 +137,330 @@ jest.mock('~/config', () => ({
     formatInstructionsForContext: mockFormatInstructions,
   })),
 }));
+
+describe('AgentClient - applyHideSequentialOutputsFilter', () => {
+  const textPart = (text) => ({ type: ContentTypes.TEXT, text });
+  const toolCallPart = (id) => ({ type: ContentTypes.TOOL_CALL, tool_call: { id } });
+
+  it('keeps only the last part + tool_call parts when hide_sequential_outputs is on', () => {
+    const ctx = {
+      options: { agent: { hide_sequential_outputs: true } },
+      contentParts: [
+        textPart('intermediate'),
+        toolCallPart('tc1'),
+        textPart('reasoning'),
+        textPart('final'),
+      ],
+    };
+    AgentClient.prototype.applyHideSequentialOutputsFilter.call(ctx);
+    expect(ctx.contentParts).toEqual([toolCallPart('tc1'), textPart('final')]);
+  });
+
+  it('is a no-op when hide_sequential_outputs is off', () => {
+    const parts = [textPart('a'), textPart('b')];
+    const ctx = { options: { agent: { hide_sequential_outputs: false } }, contentParts: parts };
+    AgentClient.prototype.applyHideSequentialOutputsFilter.call(ctx);
+    expect(ctx.contentParts).toEqual([textPart('a'), textPart('b')]);
+  });
+
+  it('rebases phase bounds across skill prepends and sequential filtering', () => {
+    const reasoning = { type: ContentTypes.THINK, think: 'checking' };
+    const activityTool = toolCallPart('activity-tool');
+    const phase = {
+      type: ContentTypes.ACTIVITY_LABEL,
+      activity_label: 'Resolved the session issue',
+      activity_label_type: 'phase',
+      activity_start_index: 0,
+    };
+    const final = textPart('final');
+    const previousParts = [reasoning, activityTool, phase, final];
+    const skillCard = toolCallPart('manual-skill');
+    const ctx = {
+      options: { agent: { hide_sequential_outputs: true } },
+      contentParts: [skillCard, ...previousParts],
+    };
+
+    AgentClient.prototype.applyHideSequentialOutputsFilter.call(ctx);
+    AgentClient.prototype.rebaseActivityPhaseBounds.call(ctx, previousParts);
+
+    expect(ctx.contentParts).toEqual([skillCard, activityTool, phase, final]);
+    expect(phase.activity_start_index).toBe(1);
+  });
+
+  it('rebases phase bounds over sparse content without treating holes as retained parts', () => {
+    const reasoning = { type: ContentTypes.THINK, think: 'planning' };
+    const toolCall = toolCallPart('tc-sparse');
+    const phase = {
+      type: ContentTypes.ACTIVITY_LABEL,
+      activity_label: 'Searched for tools',
+      activity_label_type: 'phase',
+      activity_start_index: 1,
+    };
+    const final = textPart('answer');
+    const contentParts = [];
+    contentParts[0] = reasoning;
+    contentParts[2] = toolCall;
+    contentParts[3] = phase;
+    contentParts[4] = final;
+    const previousParts = [...contentParts];
+    const ctx = { options: { agent: {} }, contentParts };
+
+    expect(() =>
+      AgentClient.prototype.rebaseActivityPhaseBounds.call(ctx, previousParts),
+    ).not.toThrow();
+    expect(phase.activity_start_index).toBe(2);
+  });
+});
+
+describe('AgentClient - startup telemetry', () => {
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  it('overlaps run creation with checkpoint pruning and joins both before stream processing', async () => {
+    let releaseCheckpoint;
+    let checkpointStarted;
+    const runCreation = deferred();
+    const checkpointStartedPromise = new Promise((resolve) => {
+      checkpointStarted = resolve;
+    });
+    const checkpointPromise = new Promise((resolve) => {
+      releaseCheckpoint = resolve;
+    });
+    const processStream = jest.fn().mockResolvedValue();
+    const run = {
+      Graph: null,
+      processStream,
+      getCalibrationRatio: jest.fn(() => 0),
+    };
+    const startupTelemetry = {
+      mark: jest.fn(),
+      setStreamId: jest.fn(),
+      recordGenerationEvent: jest.fn(),
+      end: jest.fn(),
+    };
+    mockCreateRun.mockReturnValue(runCreation.promise);
+    mockIsHITLEnabled.mockReturnValue(true);
+    mockDeleteAgentCheckpoint.mockImplementation(() => {
+      checkpointStarted();
+      return checkpointPromise;
+    });
+
+    const client = new AgentClient({
+      req: {
+        user: { id: 'user-123' },
+        body: {},
+        config: { endpoints: { [EModelEndpoint.agents]: { toolApproval: {} } } },
+        _resumableStreamId: 'conversation-123',
+      },
+      res: {},
+      agent: {
+        id: 'agent-123',
+        endpoint: EModelEndpoint.openAI,
+        provider: EModelEndpoint.openAI,
+        model_parameters: { model: 'gpt-4' },
+        hide_sequential_outputs: false,
+      },
+      endpointTokenConfig: {},
+      eventHandlers: {},
+      contentParts: [],
+      collectedUsage: [],
+      artifactPromises: [],
+      startupTelemetry,
+      checkpointNamespace: '1000',
+    });
+    client.conversationId = 'conversation-123';
+    client.responseMessageId = 'response-123';
+    client.parentMessageId = 'parent-123';
+    client.recordCollectedUsage = jest.fn().mockResolvedValue();
+
+    const completionPromise = client.chatCompletion({ payload: [] });
+    await checkpointStartedPromise;
+
+    expect(mockCreateRun).toHaveBeenCalledTimes(1);
+    expect(mockDeleteAgentCheckpoint).toHaveBeenCalledWith(
+      'conversation-123',
+      undefined,
+      undefined,
+      { throwOnError: true, checkpointNamespace: '1000' },
+    );
+    expect(startupTelemetry.mark.mock.calls.map(([milestone]) => milestone)).toEqual([
+      'run_input_prepared',
+    ]);
+    expect(processStream).not.toHaveBeenCalled();
+
+    runCreation.resolve(run);
+    await Promise.resolve();
+
+    expect(startupTelemetry.mark.mock.calls.map(([milestone]) => milestone)).toEqual([
+      'run_input_prepared',
+      'run_created',
+    ]);
+    expect(processStream).not.toHaveBeenCalled();
+
+    releaseCheckpoint();
+    await completionPromise;
+
+    expect(startupTelemetry.mark.mock.calls.map(([milestone]) => milestone)).toEqual([
+      'run_input_prepared',
+      'run_created',
+      'stream_processing_started',
+    ]);
+    expect(processStream).toHaveBeenCalledTimes(1);
+    expect(processStream.mock.calls[0][1]).toEqual(
+      expect.objectContaining({
+        configurable: expect.objectContaining({
+          thread_id: 'conversation-123',
+          checkpoint_ns: '',
+          __librechat_checkpoint_ns: '1000',
+        }),
+      }),
+    );
+  });
+
+  it('does not expose or process a fresh graph when strict checkpoint pruning fails', async () => {
+    jest.clearAllMocks();
+    const checkpointGeneration = {
+      threadId: 'conversation-123',
+      checkpointIds: ['legacy-root', 'legacy-child'],
+    };
+    const processStream = jest.fn().mockResolvedValue();
+    const run = {
+      Graph: { id: 'must-not-be-exposed' },
+      processStream,
+      getCalibrationRatio: jest.fn(() => 0),
+    };
+    mockCreateRun.mockResolvedValue(run);
+    mockIsHITLEnabled.mockReturnValue(true);
+    mockCaptureAgentCheckpointGeneration.mockResolvedValue(checkpointGeneration);
+    mockDeleteAgentCheckpoint.mockRejectedValue(new Error('checkpoint prune failed'));
+    jest.spyOn(GenerationJobManager, 'getJobStore').mockReturnValue({
+      getJob: jest.fn().mockResolvedValue({ createdAt: 1000, status: 'running' }),
+    });
+
+    const client = new AgentClient({
+      req: {
+        user: { id: 'user-123' },
+        body: {},
+        config: { endpoints: { [EModelEndpoint.agents]: { toolApproval: {} } } },
+        _resumableStreamId: 'conversation-123',
+      },
+      res: {},
+      agent: {
+        id: 'agent-123',
+        endpoint: EModelEndpoint.openAI,
+        provider: EModelEndpoint.openAI,
+        model_parameters: { model: 'gpt-4' },
+        hide_sequential_outputs: false,
+      },
+      endpointTokenConfig: {},
+      eventHandlers: {},
+      contentParts: [],
+      collectedUsage: [],
+      artifactPromises: [],
+      startupTelemetry: {
+        mark: jest.fn(),
+        setStreamId: jest.fn(),
+        recordGenerationEvent: jest.fn(),
+        end: jest.fn(),
+      },
+    });
+    client.conversationId = 'conversation-123';
+    client.jobCreatedAt = 1000;
+    client.responseMessageId = 'response-123';
+    client.parentMessageId = 'parent-123';
+    client.recordCollectedUsage = jest.fn().mockResolvedValue();
+
+    await client.chatCompletion({ payload: [] });
+
+    expect(mockDeleteAgentCheckpoint).toHaveBeenCalledWith(
+      'conversation-123',
+      undefined,
+      checkpointGeneration,
+      { throwOnError: true },
+    );
+    expect(processStream).not.toHaveBeenCalled();
+    expect(client.run).not.toBe(run);
+    expect(client.contentParts).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          [ContentTypes.ERROR]: expect.stringContaining('checkpoint prune failed'),
+        }),
+      ]),
+    );
+  });
+
+  it('does not let a stale v1 fresh prune delete a paused v2 replacement generation', async () => {
+    jest.clearAllMocks();
+    const checkpointGeneration = {
+      threadId: 'conversation-123',
+      checkpointIds: ['legacy-root', 'legacy-child'],
+    };
+    const processStream = jest.fn().mockResolvedValue();
+    const run = {
+      Graph: { id: 'stale-v1-graph' },
+      processStream,
+      getCalibrationRatio: jest.fn(() => 0),
+    };
+    mockCreateRun.mockResolvedValue(run);
+    mockIsHITLEnabled.mockReturnValue(true);
+    mockCaptureAgentCheckpointGeneration.mockResolvedValue(checkpointGeneration);
+    const getJob = jest.fn().mockResolvedValue({
+      createdAt: 2000,
+      status: 'requires_action',
+      checkpointNamespace: '2000',
+    });
+    jest.spyOn(GenerationJobManager, 'getJobStore').mockReturnValue({ getJob });
+
+    const client = new AgentClient({
+      req: {
+        user: { id: 'user-123' },
+        body: {},
+        config: { endpoints: { [EModelEndpoint.agents]: { toolApproval: {} } } },
+        _resumableStreamId: 'conversation-123',
+      },
+      res: {},
+      agent: {
+        id: 'agent-123',
+        endpoint: EModelEndpoint.openAI,
+        provider: EModelEndpoint.openAI,
+        model_parameters: { model: 'gpt-4' },
+        hide_sequential_outputs: false,
+      },
+      endpointTokenConfig: {},
+      eventHandlers: {},
+      contentParts: [],
+      collectedUsage: [],
+      artifactPromises: [],
+    });
+    client.conversationId = 'conversation-123';
+    client.jobCreatedAt = 1000;
+    client.responseMessageId = 'response-123';
+    client.parentMessageId = 'parent-123';
+    client.recordCollectedUsage = jest.fn().mockResolvedValue();
+
+    await client.chatCompletion({ payload: [] });
+
+    expect(mockCaptureAgentCheckpointGeneration).toHaveBeenCalledWith(
+      'conversation-123',
+      undefined,
+      { throwOnError: true },
+    );
+    expect(getJob).toHaveBeenCalledTimes(1);
+    expect(mockDeleteAgentCheckpoint).not.toHaveBeenCalled();
+    expect(processStream).not.toHaveBeenCalled();
+    expect(client.run).not.toBe(run);
+    expect(client.contentParts).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          [ContentTypes.ERROR]: expect.stringContaining(
+            'Generation replaced before legacy checkpoint cleanup',
+          ),
+        }),
+      ]),
+    );
+  });
+});
 
 describe('AgentClient - titleConvo', () => {
   let client;
@@ -223,6 +637,51 @@ describe('AgentClient - titleConvo', () => {
       // Check that generateTitle was called with correct clientOptions
       const generateTitleCall = mockRun.generateTitle.mock.calls[0][0];
       expect(generateTitleCall.clientOptions.model).toBe('gpt-3.5-turbo');
+    });
+
+    it('preserves Anthropic custom headers on title requests despite omitTitleOptions', async () => {
+      const prevKey = process.env.ANTHROPIC_API_KEY;
+      process.env.ANTHROPIC_API_KEY = 'sk-ant-test';
+      try {
+        const req = {
+          user: { id: 'user-123' },
+          body: { model: 'claude-sonnet-4-5', endpoint: EModelEndpoint.anthropic, key: null },
+          config: {
+            endpoints: {
+              [EModelEndpoint.anthropic]: {
+                headers: { 'X-Conversation-Id': '{{LIBRECHAT_BODY_CONVERSATIONID}}' },
+              },
+            },
+          },
+        };
+        const agent = {
+          id: 'agent-anthropic',
+          endpoint: EModelEndpoint.anthropic,
+          provider: EModelEndpoint.anthropic,
+          model_parameters: { model: 'claude-sonnet-4-5' },
+        };
+        const anthropicClient = new AgentClient({ req, res: {}, agent, endpointTokenConfig: {} });
+        anthropicClient.run = mockRun;
+        anthropicClient.responseMessageId = 'response-123';
+        anthropicClient.conversationId = 'convo-123';
+        anthropicClient.contentParts = [{ type: 'text', text: 'Test content' }];
+        anthropicClient.recordCollectedUsage = jest.fn().mockResolvedValue();
+
+        await anthropicClient.titleConvo({ text: 'Hello', abortController: new AbortController() });
+
+        const defaultHeaders =
+          mockRun.generateTitle.mock.calls[0][0].clientOptions?.clientOptions?.defaultHeaders;
+        // Custom header survives the `omitTitleOptions` strip and resolves the conversationId
+        expect(defaultHeaders?.['X-Conversation-Id']).toBe('convo-123');
+        // Provider-managed beta header is preserved alongside it
+        expect(defaultHeaders?.['anthropic-beta']).toBeDefined();
+      } finally {
+        if (prevKey === undefined) {
+          delete process.env.ANTHROPIC_API_KEY;
+        } else {
+          process.env.ANTHROPIC_API_KEY = prevKey;
+        }
+      }
     });
 
     it('should handle missing endpoint config gracefully', async () => {
@@ -1352,6 +1811,112 @@ describe('AgentClient - titleConvo', () => {
       client.maxContextTokens = 4096;
     });
 
+    it('loads RAG, memory, attachment, and MCP context without serial waits', async () => {
+      const ragContext = deferred();
+      const memoryContext = deferred();
+      const mcpConfig = deferred();
+      client.contextHandlers = {
+        createContext: jest.fn(() => ragContext.promise),
+      };
+      client.useMemory = jest.fn(() => memoryContext.promise);
+      resolveConfigServers.mockReturnValueOnce(mcpConfig.promise);
+
+      const buildPromise = client.buildMessages(
+        [
+          {
+            messageId: 'msg-1',
+            parentMessageId: null,
+            sender: 'User',
+            text: 'Load all context.',
+            isCreatedByUser: true,
+          },
+        ],
+        null,
+        {},
+      );
+
+      expect(client.contextHandlers.createContext).toHaveBeenCalledTimes(1);
+      expect(client.useMemory).toHaveBeenCalledTimes(1);
+      expect(resolveConfigServers).toHaveBeenCalledWith(mockReq);
+
+      ragContext.resolve('Retrieved context');
+      memoryContext.resolve(undefined);
+      mcpConfig.resolve({});
+      await buildPromise;
+
+      expect(client.augmentedPrompt).toBe('Retrieved context');
+      expect(client.options.agent.additional_instructions).toContain('Retrieved context');
+    });
+
+    it('starts independent context and current-file work at their earliest dependency barriers', async () => {
+      const requestAttachments = deferred();
+      const memoryContext = deferred();
+      const mcpConfig = deferred();
+      const agentScopedContext = deferred();
+      const fileContext = deferred();
+      const providerAttachments = deferred();
+      const requestFile = {
+        file_id: 'request-file',
+        filename: 'request.txt',
+        source: 'text',
+        type: 'text/plain',
+      };
+
+      client.options.attachments = requestAttachments.promise;
+      client.useMemory = jest.fn(() => memoryContext.promise);
+      resolveConfigServers.mockReturnValueOnce(mcpConfig.promise);
+      mockBuildAgentScopedContext.mockReturnValueOnce(agentScopedContext.promise);
+      client.addFileContextToMessage = jest.fn(() => fileContext.promise);
+      client.processAttachments = jest.fn(() => providerAttachments.promise);
+
+      const buildPromise = client.buildMessages(
+        [
+          {
+            messageId: 'msg-early-context',
+            parentMessageId: null,
+            sender: 'User',
+            text: 'Load the request file.',
+            isCreatedByUser: true,
+          },
+        ],
+        'msg-early-context',
+        {},
+      );
+
+      expect(client.useMemory).toHaveBeenCalledTimes(1);
+      expect(resolveConfigServers).toHaveBeenCalledWith(mockReq);
+      expect(mockBuildAgentScopedContext).not.toHaveBeenCalled();
+      expect(client.addFileContextToMessage).not.toHaveBeenCalled();
+      expect(client.processAttachments).not.toHaveBeenCalled();
+
+      requestAttachments.resolve([requestFile]);
+      await Promise.resolve();
+
+      expect(mockBuildAgentScopedContext).toHaveBeenCalledTimes(1);
+      const scopedContextArgs = mockBuildAgentScopedContext.mock.calls[0][0];
+      expect([...scopedContextArgs.sharedRunAttachmentIds]).toEqual(['request-file']);
+      expect(client.addFileContextToMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ messageId: 'msg-early-context' }),
+        [requestFile],
+      );
+      expect(client.processAttachments).toHaveBeenCalledWith(
+        expect.objectContaining({ messageId: 'msg-early-context' }),
+        [requestFile],
+      );
+
+      providerAttachments.resolve([requestFile]);
+      await Promise.resolve();
+      expect(client.options.attachments).toBe(requestAttachments.promise);
+
+      fileContext.resolve();
+      memoryContext.resolve(undefined);
+      mcpConfig.resolve({});
+      agentScopedContext.resolve(new Map());
+      await buildPromise;
+
+      expect(client.options.attachments).toEqual([requestFile]);
+    });
+
     it('should await MCP instructions and not include [object Promise] in agent instructions', async () => {
       // Set specific return value for this test
       mockFormatInstructions.mockResolvedValue(
@@ -2316,7 +2881,9 @@ describe('AgentClient - titleConvo', () => {
 
     it('should only pass memory context to the primary agent by default', async () => {
       const memoryContent = 'User prefers dark mode. User is a software developer.';
-      client.useMemory = jest.fn().mockResolvedValue(memoryContent);
+      client.useMemory = jest
+        .fn()
+        .mockResolvedValue({ withKeys: memoryContent, withoutKeys: memoryContent });
 
       const parallelAgent1 = {
         id: 'parallel-agent-1',
@@ -2369,7 +2936,9 @@ describe('AgentClient - titleConvo', () => {
 
     it('should pass memory context to parallel agents when automatic memory updates are enabled', async () => {
       const memoryContent = 'User prefers dark mode. User is a software developer.';
-      client.useMemory = jest.fn().mockResolvedValue(memoryContent);
+      client.useMemory = jest
+        .fn()
+        .mockResolvedValue({ withKeys: memoryContent, withoutKeys: memoryContent });
       mockReq.config.memory.agent = {
         enabled: true,
         id: 'memory-agent',
@@ -2440,7 +3009,9 @@ describe('AgentClient - titleConvo', () => {
 
     it('should handle parallel agents without existing instructions when memory stays primary-only', async () => {
       const memoryContent = 'User is a data scientist.';
-      client.useMemory = jest.fn().mockResolvedValue(memoryContent);
+      client.useMemory = jest
+        .fn()
+        .mockResolvedValue({ withKeys: memoryContent, withoutKeys: memoryContent });
 
       const parallelAgentNoInstructions = {
         id: 'parallel-agent-no-instructions',
@@ -2476,7 +3047,9 @@ describe('AgentClient - titleConvo', () => {
 
     it('should not modify agentConfigs when none exist', async () => {
       const memoryContent = 'User prefers concise responses.';
-      client.useMemory = jest.fn().mockResolvedValue(memoryContent);
+      client.useMemory = jest
+        .fn()
+        .mockResolvedValue({ withKeys: memoryContent, withoutKeys: memoryContent });
 
       client.agentConfigs = null;
 
@@ -2502,7 +3075,9 @@ describe('AgentClient - titleConvo', () => {
 
     it('should handle empty agentConfigs map', async () => {
       const memoryContent = 'User likes detailed explanations.';
-      client.useMemory = jest.fn().mockResolvedValue(memoryContent);
+      client.useMemory = jest
+        .fn()
+        .mockResolvedValue({ withKeys: memoryContent, withoutKeys: memoryContent });
 
       client.agentConfigs = new Map();
 
@@ -2618,6 +3193,29 @@ describe('AgentClient - titleConvo', () => {
       );
     });
 
+    it('should bind memory processing to the current generation epoch', async () => {
+      mockReq._resumableStreamId = 'convo-123';
+      mockCheckAccess.mockResolvedValue(true);
+      mockInitializeAgent.mockResolvedValue({
+        ...mockAgent,
+        provider: EModelEndpoint.openAI,
+      });
+      mockCreateMemoryProcessor.mockResolvedValue([undefined, jest.fn()]);
+
+      client = new AgentClient({ ...mockOptions, jobCreatedAt: 1234 });
+      client.conversationId = 'convo-123';
+      client.responseMessageId = 'response-123';
+
+      await client.useMemory();
+
+      expect(mockCreateMemoryProcessor).toHaveBeenCalledWith(
+        expect.objectContaining({
+          streamId: 'convo-123',
+          jobCreatedAt: 1234,
+        }),
+      );
+    });
+
     it('should load different agent when memory config agent.id differs from current agent id', async () => {
       const differentAgentId = 'different-agent-456';
       const differentAgent = {
@@ -2675,7 +3273,7 @@ describe('AgentClient - titleConvo', () => {
 
       const result = await client.useMemory();
 
-      expect(result).toBe('likes pasta');
+      expect(result).toEqual({ withKeys: 'food: likes pasta', withoutKeys: 'likes pasta' });
       expect(mockGetFormattedMemories).toHaveBeenCalledWith({ userId: 'user-123' });
       expect(mockInitializeAgent).not.toHaveBeenCalled();
       expect(mockCreateMemoryProcessor).not.toHaveBeenCalled();
@@ -2700,7 +3298,7 @@ describe('AgentClient - titleConvo', () => {
 
       const result = await client.useMemory();
 
-      expect(result).toBe('');
+      expect(result).toEqual({ withKeys: '', withoutKeys: '' });
       expect(mockGetFormattedMemories).toHaveBeenCalledWith({ userId: 'user-123' });
       expect(mockInitializeAgent).not.toHaveBeenCalled();
       expect(mockCreateMemoryProcessor).not.toHaveBeenCalled();
@@ -2725,7 +3323,7 @@ describe('AgentClient - titleConvo', () => {
 
       const result = await client.useMemory();
 
-      expect(result).toBe('prefers concise answers');
+      expect(result).toEqual({ withKeys: 'tone: concise', withoutKeys: 'prefers concise answers' });
       expect(mockLoadAgent).not.toHaveBeenCalled();
       expect(mockInitializeAgent).not.toHaveBeenCalled();
       expect(mockCreateMemoryProcessor).not.toHaveBeenCalled();

@@ -1,6 +1,13 @@
 const { nanoid } = require('nanoid');
 const { logger } = require('@librechat/data-schemas');
-const { Tools, StepTypes, FileContext, ErrorTypes } = require('librechat-data-provider');
+const {
+  Tools,
+  StepTypes,
+  StepEvents,
+  FileContext,
+  ErrorTypes,
+  UsageEvents,
+} = require('librechat-data-provider');
 const {
   GraphEvents,
   GraphNodeKeys,
@@ -9,11 +16,15 @@ const {
 } = require('@librechat/agents');
 const {
   sendEvent,
+  computeUsageCostUSD,
   GenerationJobManager,
   writeAttachmentEvent,
   createToolExecuteHandler,
+  createBackgroundCodeResultHandler: createCodeHarvestHandler,
   HOST_FILE_AUTHORING_ARTIFACT_KEY,
   isCodeSessionToolName,
+  shouldSignalSandboxStart,
+  getToolInputValidationDetails,
 } = require('@librechat/api');
 const { processFileCitations } = require('~/server/services/Files/Citations');
 const { processCodeOutput, runPreviewFinalize } = require('~/server/services/Files/Code/process');
@@ -41,13 +52,16 @@ class ModelEndHandler {
    *   Optional; when `null`, the handler is a no-op for signatures. Non-Vertex
    *   providers don't emit `additional_kwargs.signatures`, so capture is also
    *   a no-op for them even when the map is provided.
+   * @param {(data: Record<string, unknown>) => Promise<void> | void} [emitUsage] Optional
+   *   callback to stream per-call token usage to the client.
    */
-  constructor(collectedUsage, collectedThoughtSignatures = null) {
+  constructor(collectedUsage, collectedThoughtSignatures = null, emitUsage = null) {
     if (!Array.isArray(collectedUsage)) {
       throw new Error('collectedUsage must be an array');
     }
     this.collectedUsage = collectedUsage;
     this.collectedThoughtSignatures = collectedThoughtSignatures;
+    this.emitUsage = emitUsage;
   }
 
   finalize(errorMessage) {
@@ -99,10 +113,65 @@ class ModelEndHandler {
       if (agentContext.provider) {
         usage.provider = agentContext.provider;
       }
+      /** Tag the producing agent so multi-endpoint graphs can price each call
+       *  with its own endpoint token config (recordCollectedUsage resolver). */
+      if (agentContext.agentId) {
+        usage.agentId = agentContext.agentId;
+      }
 
-      const taggedUsage = markSummarizationUsage(usage, metadata);
+      let taggedUsage = markSummarizationUsage(usage, metadata);
+      /** Hidden intermediate sequential-agent calls are billed but never shown.
+       *  Tag them non-primary on the COLLECTED usage too (not just the emit) so
+       *  recordCollectedUsage excludes their output from the parent's tokenCount
+       *  and the client folds them into cost/totals only — not the live gauge. */
+      if (
+        taggedUsage.usage_type == null &&
+        !checkIfLastAgent(metadata?.last_agent_id, metadata?.langgraph_node) &&
+        metadata?.hide_sequential_outputs === true
+      ) {
+        taggedUsage = { ...taggedUsage, usage_type: 'sequential' };
+      }
 
       this.collectedUsage.push(taggedUsage);
+
+      if (this.emitUsage) {
+        /** Normalize Anthropic/Bedrock top-level and OpenAI GPT-5.6
+         *  `cache_write_tokens` cache fields into details so the emitted/persisted
+         *  usage cost matches what billing charges (getCacheCreationTokens). */
+        const cache_creation =
+          taggedUsage.input_token_details?.cache_creation ??
+          taggedUsage.input_token_details?.cache_write_tokens ??
+          taggedUsage.cache_creation_input_tokens ??
+          taggedUsage.cache_write_tokens;
+        const cache_read =
+          taggedUsage.input_token_details?.cache_read ?? taggedUsage.cache_read_input_tokens;
+        try {
+          await this.emitUsage({
+            input_tokens: taggedUsage.input_tokens,
+            output_tokens: taggedUsage.output_tokens,
+            total_tokens: taggedUsage.total_tokens,
+            input_token_details:
+              cache_creation != null || cache_read != null
+                ? { cache_creation, cache_read }
+                : undefined,
+            model: taggedUsage.model,
+            provider: taggedUsage.provider,
+            usage_type: taggedUsage.usage_type,
+            /** Producing agent for per-endpoint pricing; consumed by the emit
+             *  cost resolver and not included in the emitted/persisted payload. */
+            agentId: taggedUsage.agentId,
+            runId: metadata?.run_id,
+            /** Per-run sequence so identical payloads from distinct calls
+             *  stay distinguishable during resume dedupe */
+            seq: this.collectedUsage.length,
+          });
+        } catch (err) {
+          /** Best-effort telemetry: a failed emit (closed SSE, Redis publish
+           *  error) must not abort the handler before the thought-signature
+           *  capture below, or resumed tool-call requests lose that metadata */
+          logger.warn('[ModelEndHandler] Failed to emit token usage', err);
+        }
+      }
 
       /**
        * `additional_kwargs.signatures` is a flat array indexed by response
@@ -153,13 +222,44 @@ function checkIfLastAgent(last_agent_id, langgraph_node) {
  * @param {ServerResponse} res - The server response object
  * @param {string | null} streamId - The stream ID for resumable mode, or null for standard mode
  * @param {Object} eventData - The event data to send
+ * @param {number} [expectedCreatedAt] - The generation epoch that produced the event
  * @returns {Promise<void>}
  */
-async function emitEvent(res, streamId, eventData) {
+async function emitEvent(res, streamId, eventData, expectedCreatedAt) {
   if (streamId) {
-    await GenerationJobManager.emitChunk(streamId, eventData);
+    await GenerationJobManager.emitChunk(streamId, eventData, { expectedCreatedAt });
   } else {
     sendEvent(res, eventData);
+  }
+}
+
+/**
+ * Emits `on_sandbox_starting` for each code-execution tool call in the run
+ * step when the conversation's stateful sandbox is still cold-booting, so the
+ * UI can explain the first call's boot latency instead of showing a generic
+ * running state. Only signals while a fired prewarm remains unresolved
+ * ({@link shouldSignalSandboxStart}); stateless deployments never fire one
+ * and completed boots clear the marker, so both stay on the generic label.
+ * @param {(eventData: Object) => Promise<void>} emitForJob - Generation-fenced event emitter
+ * @param {StreamEventData} data - The `on_run_step` event data
+ * @param {GraphRunnableConfig['configurable']} [metadata] The runnable metadata
+ * @returns {Promise<void>}
+ */
+async function maybeEmitSandboxStarting(emitForJob, data, metadata) {
+  const conversationId = metadata?.thread_id;
+  if (!conversationId || !(await shouldSignalSandboxStart(conversationId))) {
+    return;
+  }
+  const toolCalls = data?.stepDetails?.tool_calls ?? [];
+  for (const toolCall of toolCalls) {
+    const name = toolCall?.name ?? toolCall?.function?.name;
+    if (!toolCall?.id || name == null || !isCodeSessionToolName(name)) {
+      continue;
+    }
+    await emitForJob({
+      event: StepEvents.ON_SANDBOX_STARTING,
+      data: { tool_call_id: toolCall.id, runId: metadata?.run_id },
+    });
   }
 }
 
@@ -216,31 +316,86 @@ function feedSubagentAggregator(aggregator, event) {
  * @param {Object} options - The options object.
  * @param {ServerResponse} options.res - The server response object.
  * @param {ContentAggregator} options.aggregateContent - Content aggregator function.
+ * @param {Array<Object>} [options.contentParts] - Aggregated message content parts.
+ * @param {Map<string, Object>} [options.stepMap] - Run steps keyed by step ID.
+ * @param {Map<string, import('@librechat/api').ToolInputValidationError>} [options.toolInputValidationErrors]
+ *   Schema-validation errors keyed by tool-call ID at the execution error boundary.
  * @param {ToolEndCallback} options.toolEndCallback - Callback to use when tool ends.
  * @param {Array<UsageMetadata>} options.collectedUsage - The list of collected usage metadata.
  * @param {string | null} [options.streamId] - The stream ID for resumable mode, or null for standard mode.
+ * @param {number} [options.jobCreatedAt] - The generation epoch that owns emitted events.
  * @param {ToolExecuteOptions} [options.toolExecuteOptions] - Options for event-driven tool execution.
+ * @param {UsageCostDeps} [options.usageCost] - Pricing context for authoritative per-event cost.
+ * @param {{ latest: TContextUsageEvent | null, count: number }} [options.contextUsageSink] - Mutable
+ *   holder for the latest visible context snapshot + a count of visible snapshots (model calls),
+ *   used to persist the breakdown only when the final call emitted usage.
+ * @param {Array<TTokenUsageEvent>} [options.usageEmitSink] - Array collecting each emitted
+ *   `on_token_usage` payload (incl. cost) so the response's usage rollup can be persisted.
  * @returns {Record<string, t.EventHandler>} The default handlers.
  * @throws {Error} If the request is not found.
  */
 function getDefaultHandlers({
   res,
   aggregateContent,
+  contentParts = null,
+  stepMap = null,
+  toolInputValidationErrors = null,
   toolEndCallback,
   collectedUsage,
   collectedThoughtSignatures = null,
   streamId = null,
+  jobCreatedAt,
   toolExecuteOptions = null,
   summarizationOptions = null,
   subagentAggregatorsByToolCallId = null,
+  usageCost = null,
+  contextUsageSink = null,
+  usageEmitSink = null,
 }) {
   if (!res || !aggregateContent) {
     throw new Error(
       `[getDefaultHandlers] Missing required options: res: ${!res}, aggregateContent: ${!aggregateContent}`,
     );
   }
+  const emitForJob = (eventData) => emitEvent(res, streamId, eventData, jobCreatedAt);
+  /**
+   * Emit a token-usage event, attaching the authoritative per-event USD cost
+   * when cost display is enabled. The backend is the single source of truth
+   * for pricing (premium tiers, cache rates) — the client sums these instead
+   * of re-deriving from base rates.
+   * @param {Record<string, unknown>} data
+   */
+  const emitTokenUsage = ({ agentId, ...data }) => {
+    let payload = data;
+    if (usageCost?.enabled === true && usageCost.pricing) {
+      try {
+        /** Price with the producing agent's config (multi-endpoint graphs) so
+         *  the streamed/persisted cost matches the per-agent balance transaction;
+         *  `agentId` is resolved here, not forwarded to the client or rollup. */
+        const endpointTokenConfig = usageCost.resolveEndpointTokenConfig
+          ? usageCost.resolveEndpointTokenConfig({ agentId })
+          : usageCost.endpointTokenConfig;
+        payload = {
+          ...data,
+          cost: computeUsageCostUSD(data, usageCost.pricing, endpointTokenConfig),
+        };
+      } catch (err) {
+        logger.warn('[getDefaultHandlers] Failed to compute usage cost', err);
+      }
+    }
+    /** Collect the same payload the client folds so the response's usage rollup
+     *  persisted on `metadata.usage` reproduces the live branch/total + cost. */
+    if (usageEmitSink) {
+      usageEmitSink.push(payload);
+    }
+    return emitForJob({ event: UsageEvents.ON_TOKEN_USAGE, data: payload });
+  };
   const handlers = {
-    [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(collectedUsage, collectedThoughtSignatures),
+    [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(
+      collectedUsage,
+      collectedThoughtSignatures,
+      emitTokenUsage,
+    ),
     [GraphEvents.TOOL_END]: new ToolEndHandler(toolEndCallback, logger),
     [GraphEvents.ON_RUN_STEP]: {
       /**
@@ -252,16 +407,17 @@ function getDefaultHandlers({
       handle: async (event, data, metadata) => {
         aggregateContent({ event, data });
         if (data?.stepDetails.type === StepTypes.TOOL_CALLS) {
-          await emitEvent(res, streamId, { event, data });
+          await emitForJob({ event, data });
+          await maybeEmitSandboxStarting(emitForJob, data, metadata);
         } else if (checkIfLastAgent(metadata?.last_agent_id, metadata?.langgraph_node)) {
-          await emitEvent(res, streamId, { event, data });
+          await emitForJob({ event, data });
         } else if (!metadata?.hide_sequential_outputs) {
-          await emitEvent(res, streamId, { event, data });
+          await emitForJob({ event, data });
         } else {
           const agentName = metadata?.name ?? 'Agent';
           const isToolCall = data?.stepDetails.type === StepTypes.TOOL_CALLS;
           const action = isToolCall ? 'performing a task...' : 'thinking...';
-          await emitEvent(res, streamId, {
+          await emitForJob({
             event: 'on_agent_update',
             data: {
               runId: metadata?.run_id,
@@ -281,11 +437,11 @@ function getDefaultHandlers({
       handle: async (event, data, metadata) => {
         aggregateContent({ event, data });
         if (data?.delta.type === StepTypes.TOOL_CALLS) {
-          await emitEvent(res, streamId, { event, data });
+          await emitForJob({ event, data });
         } else if (checkIfLastAgent(metadata?.last_agent_id, metadata?.langgraph_node)) {
-          await emitEvent(res, streamId, { event, data });
+          await emitForJob({ event, data });
         } else if (!metadata?.hide_sequential_outputs) {
-          await emitEvent(res, streamId, { event, data });
+          await emitForJob({ event, data });
         }
       },
     },
@@ -297,13 +453,38 @@ function getDefaultHandlers({
        * @param {GraphRunnableConfig['configurable']} [metadata] The runnable metadata.
        */
       handle: async (event, data, metadata) => {
+        const toolCallId = data?.result?.tool_call?.id;
+        const validationError =
+          typeof toolCallId === 'string' ? toolInputValidationErrors?.get(toolCallId) : null;
+        const validationDetails = getToolInputValidationDetails(data?.result, validationError);
+        if (typeof toolCallId === 'string') {
+          toolInputValidationErrors?.delete(toolCallId);
+        }
+        if (validationDetails != null) {
+          if (data?.result?.tool_call != null) {
+            data.result.tool_call.inputValidationError = true;
+          }
+          logger.debug('[AgentToolValidation] Tool input rejected', {
+            ...validationDetails,
+            runId: metadata?.run_id,
+            conversationId: metadata?.thread_id,
+            agentId: metadata?.agent_id,
+          });
+        }
         aggregateContent({ event, data });
+        if (validationDetails != null) {
+          const runStep = stepMap?.get(data?.result?.id);
+          const toolCall = contentParts?.[runStep?.index]?.tool_call;
+          if (toolCall != null) {
+            toolCall.inputValidationError = true;
+          }
+        }
         if (data?.result != null) {
-          await emitEvent(res, streamId, { event, data });
+          await emitForJob({ event, data });
         } else if (checkIfLastAgent(metadata?.last_agent_id, metadata?.langgraph_node)) {
-          await emitEvent(res, streamId, { event, data });
+          await emitForJob({ event, data });
         } else if (!metadata?.hide_sequential_outputs) {
-          await emitEvent(res, streamId, { event, data });
+          await emitForJob({ event, data });
         }
       },
     },
@@ -317,9 +498,9 @@ function getDefaultHandlers({
       handle: async (event, data, metadata) => {
         aggregateContent({ event, data });
         if (checkIfLastAgent(metadata?.last_agent_id, metadata?.langgraph_node)) {
-          await emitEvent(res, streamId, { event, data });
+          await emitForJob({ event, data });
         } else if (!metadata?.hide_sequential_outputs) {
-          await emitEvent(res, streamId, { event, data });
+          await emitForJob({ event, data });
         }
       },
     },
@@ -333,9 +514,9 @@ function getDefaultHandlers({
       handle: async (event, data, metadata) => {
         aggregateContent({ event, data });
         if (checkIfLastAgent(metadata?.last_agent_id, metadata?.langgraph_node)) {
-          await emitEvent(res, streamId, { event, data });
+          await emitForJob({ event, data });
         } else if (!metadata?.hide_sequential_outputs) {
-          await emitEvent(res, streamId, { event, data });
+          await emitForJob({ event, data });
         }
       },
     },
@@ -390,14 +571,14 @@ function getDefaultHandlers({
           );
         }
       }
-      await emitEvent(res, streamId, { event, data });
+      await emitForJob({ event, data });
     },
   };
 
   if (summarizationOptions?.enabled !== false) {
     handlers[GraphEvents.ON_SUMMARIZE_START] = {
       handle: async (_event, data) => {
-        await emitEvent(res, streamId, {
+        await emitForJob({
           event: GraphEvents.ON_SUMMARIZE_START,
           data,
         });
@@ -406,7 +587,7 @@ function getDefaultHandlers({
     handlers[GraphEvents.ON_SUMMARIZE_DELTA] = {
       handle: async (_event, data) => {
         aggregateContent({ event: GraphEvents.ON_SUMMARIZE_DELTA, data });
-        await emitEvent(res, streamId, {
+        await emitForJob({
           event: GraphEvents.ON_SUMMARIZE_DELTA,
           data,
         });
@@ -415,7 +596,7 @@ function getDefaultHandlers({
     handlers[GraphEvents.ON_SUMMARIZE_COMPLETE] = {
       handle: async (_event, data) => {
         aggregateContent({ event: GraphEvents.ON_SUMMARIZE_COMPLETE, data });
-        await emitEvent(res, streamId, {
+        await emitForJob({
           event: GraphEvents.ON_SUMMARIZE_COMPLETE,
           data,
         });
@@ -424,6 +605,43 @@ function getDefaultHandlers({
   }
 
   handlers[GraphEvents.ON_AGENT_LOG] = { handle: agentLogHandler };
+
+  /** Guarded: no-op when the installed @librechat/agents predates the event */
+  if (GraphEvents.ON_CONTEXT_USAGE) {
+    handlers[GraphEvents.ON_CONTEXT_USAGE] = {
+      /**
+       * Forward per-model-call context usage snapshots to the client,
+       * honoring the same sequential-agent visibility gate as deltas.
+       * @param {string} event - The event name.
+       * @param {StreamEventData} data - The event data.
+       * @param {GraphRunnableConfig['configurable']} [metadata] The runnable metadata.
+       */
+      handle: async (event, data, metadata) => {
+        if (
+          checkIfLastAgent(metadata?.last_agent_id, metadata?.langgraph_node) ||
+          !metadata?.hide_sequential_outputs
+        ) {
+          /** Capture the latest visible snapshot (last-wins) and how many usage
+           *  events preceded it BEFORE awaiting the emit. `emitEvent` can yield
+           *  (resumable SSE / Redis publish); with parallel runs active this
+           *  call's own primary usage could land in `usageEmitSink` during that
+           *  yield, pushing `latestUsageIndex` past the very event that proves the
+           *  snapshot completed — the save path would then slice it away and drop
+           *  a valid breakdown. The recorded index lets the save path persist only
+           *  when a PRIMARY usage follows this snapshot (the snapshot's call
+           *  actually invoked the model); a summarization detour emits a snapshot
+           *  whose only following usage is tagged `summarization`, which a plain
+           *  snapshot-count would over-count and wrongly drop. */
+          if (contextUsageSink) {
+            contextUsageSink.latest = data;
+            contextUsageSink.count = (contextUsageSink.count ?? 0) + 1;
+            contextUsageSink.latestUsageIndex = usageEmitSink?.length ?? 0;
+          }
+          await emitForJob({ event, data });
+        }
+      },
+    };
+  }
 
   return handlers;
 }
@@ -434,10 +652,15 @@ function getDefaultHandlers({
  * @param {ServerResponse} res - The server response object
  * @param {string | null} streamId - The stream ID for resumable mode, or null for standard mode
  * @param {Object} attachment - The attachment data
+ * @param {number} [expectedCreatedAt] - The generation epoch that produced the attachment
  */
-function writeAttachment(res, streamId, attachment) {
+function writeAttachment(res, streamId, attachment, expectedCreatedAt) {
   if (streamId) {
-    GenerationJobManager.emitChunk(streamId, { event: 'attachment', data: attachment });
+    GenerationJobManager.emitChunk(
+      streamId,
+      { event: 'attachment', data: attachment },
+      { expectedCreatedAt },
+    );
   } else {
     res.write(`event: attachment\ndata: ${JSON.stringify(attachment)}\n\n`);
   }
@@ -484,12 +707,13 @@ function isStreamWritable(res, streamId) {
  * @param {ServerResponse} res
  * @param {string | null} streamId
  * @param {Object} attachment - Updated attachment payload (must carry `file_id`).
+ * @param {number} [expectedCreatedAt] - The generation epoch that produced the attachment
  */
-function writeAttachmentUpdate(res, streamId, attachment) {
+function writeAttachmentUpdate(res, streamId, attachment, expectedCreatedAt) {
   if (!isStreamWritable(res, streamId)) {
     return;
   }
-  writeAttachment(res, streamId, attachment);
+  writeAttachment(res, streamId, attachment, expectedCreatedAt);
 }
 
 /**
@@ -499,9 +723,10 @@ function writeAttachmentUpdate(res, streamId, attachment) {
  * @param {ServerResponse} params.res
  * @param {Promise<MongoFile | { filename: string; filepath: string; expires: number;} | null>[]} params.artifactPromises
  * @param {string | null} [params.streamId] - The stream ID for resumable mode, or null for standard mode.
+ * @param {number} [params.jobCreatedAt] - The generation epoch that owns emitted attachments.
  * @returns {ToolEndCallback} The tool end callback.
  */
-function createToolEndCallback({ req, res, artifactPromises, streamId = null }) {
+function createToolEndCallback({ req, res, artifactPromises, streamId = null, jobCreatedAt }) {
   /**
    * @type {ToolEndCallback}
    */
@@ -532,7 +757,7 @@ function createToolEndCallback({ req, res, artifactPromises, streamId = null }) 
           if (!streamId && !res.headersSent) {
             return attachment;
           }
-          writeAttachment(res, streamId, attachment);
+          writeAttachment(res, streamId, attachment, jobCreatedAt);
           return attachment;
         })().catch((error) => {
           logger.error('Error processing file citations:', error);
@@ -554,7 +779,7 @@ function createToolEndCallback({ req, res, artifactPromises, streamId = null }) 
           if (!streamId && !res.headersSent) {
             return attachment;
           }
-          writeAttachment(res, streamId, attachment);
+          writeAttachment(res, streamId, attachment, jobCreatedAt);
           return attachment;
         })().catch((error) => {
           logger.error('Error processing artifact content:', error);
@@ -576,10 +801,32 @@ function createToolEndCallback({ req, res, artifactPromises, streamId = null }) 
           if (!streamId && !res.headersSent) {
             return attachment;
           }
-          writeAttachment(res, streamId, attachment);
+          writeAttachment(res, streamId, attachment, jobCreatedAt);
           return attachment;
         })().catch((error) => {
           logger.error('Error processing artifact content:', error);
+          return null;
+        }),
+      );
+    }
+
+    if (output.artifact[Tools.memory]) {
+      artifactPromises.push(
+        (async () => {
+          const attachment = {
+            type: Tools.memory,
+            messageId: metadata.run_id,
+            toolCallId: output.tool_call_id,
+            conversationId: metadata.thread_id,
+            [Tools.memory]: output.artifact[Tools.memory],
+          };
+          if (!streamId && !res.headersSent) {
+            return attachment;
+          }
+          writeAttachment(res, streamId, attachment, jobCreatedAt);
+          return attachment;
+        })().catch((error) => {
+          logger.error('Error processing memory artifact content:', error);
           return null;
         }),
       );
@@ -621,7 +868,7 @@ function createToolEndCallback({ req, res, artifactPromises, streamId = null }) 
               return null;
             }
 
-            writeAttachment(res, streamId, fileMetadata);
+            writeAttachment(res, streamId, fileMetadata, jobCreatedAt);
             return fileMetadata;
           })().catch((error) => {
             logger.error('Error processing artifact content:', error);
@@ -698,7 +945,7 @@ function createToolEndCallback({ req, res, artifactPromises, streamId = null }) 
            * IIFE catch but logged as noise). Same gate the Responses
            * path uses below. */
           if (isStreamWritable(res, streamId)) {
-            writeAttachment(res, streamId, fileMetadata);
+            writeAttachment(res, streamId, fileMetadata, jobCreatedAt);
           }
           /* Deferred preview rendering: extraction continues running
            * even after the HTTP response closes. If the stream is still
@@ -721,11 +968,16 @@ function createToolEndCallback({ req, res, artifactPromises, streamId = null }) 
             fileId: fileMetadata.file_id,
             previewRevision: result?.previewRevision,
             onResolved: (updated) => {
-              writeAttachmentUpdate(res, streamId, {
-                ...updated,
-                messageId: metadata.run_id,
-                toolCallId,
-              });
+              writeAttachmentUpdate(
+                res,
+                streamId,
+                {
+                  ...updated,
+                  messageId: metadata.run_id,
+                  toolCallId,
+                },
+                jobCreatedAt,
+              );
             },
           });
           return fileMetadata;
@@ -736,6 +988,56 @@ function createToolEndCallback({ req, res, artifactPromises, streamId = null }) 
       );
     }
   };
+}
+
+/**
+ * Emitter for `attachment` SSE events on the current request's live stream,
+ * for re-emitting background-harvested attachments on a poll turn. Safe to
+ * call after the stream closes (silently dropped).
+ *
+ * @param {Object} params
+ * @param {ServerResponse} params.res
+ * @param {string | null} [params.streamId]
+ * @param {number} [params.jobCreatedAt]
+ * @returns {(attachment: Object) => void}
+ */
+function createAttachmentEmitter({ res, streamId = null, jobCreatedAt }) {
+  return (attachment) => {
+    if (!attachment || !isStreamWritable(res, streamId)) {
+      return;
+    }
+    writeAttachment(res, streamId, attachment, jobCreatedAt);
+  };
+}
+
+/**
+ * Leading sub-second retries cover the common case of a fast background task
+ * settling moments before the dispatch turn finalizes its message row — an
+ * immediate follow-up turn should find the attachments already anchored.
+ * The long tail covers dispatch turns that keep running for minutes.
+ */
+/**
+ * Thin wrapper binding the host file services into the TS harvest
+ * implementation (`@librechat/api` `createBackgroundCodeResultHandler`).
+ *
+ * @param {Object} params
+ * @param {ServerRequest} params.req
+ * @param {(params: {
+ *   userId: string;
+ *   messageId: string;
+ *   conversationId: string;
+ *   toolCallId: string;
+ *   output?: string;
+ *   attachments?: Object[];
+ * }) => Promise<boolean>} params.updateToolCallResult
+ */
+function createBackgroundCodeResultHandler({ req, updateToolCallResult }) {
+  return createCodeHarvestHandler({
+    req,
+    updateToolCallResult,
+    processCodeOutput,
+    runPreviewFinalize,
+  });
 }
 
 /**
@@ -1074,6 +1376,8 @@ module.exports = {
   agentLogHandlerObj,
   getDefaultHandlers,
   createToolEndCallback,
+  createAttachmentEmitter,
+  createBackgroundCodeResultHandler,
   isStreamWritable,
   markSummarizationUsage,
   buildSummarizationHandlers,

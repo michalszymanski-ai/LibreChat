@@ -1,3 +1,4 @@
+import path from 'node:path';
 import { defineConfig } from 'tsdown';
 
 export default defineConfig({
@@ -7,6 +8,8 @@ export default defineConfig({
   dts: { oxc: true },
   outDir: 'dist',
   sourcemap: true,
+  // Warn on module cycles at build time; CI enforces via config/circular-deps.mjs.
+  checks: { circularDependency: true },
   // Externalize all third-party deps (consumers provide the peers); bundle only `dotenv`
   // so the package stays self-contained for its env-loading side effect, matching the
   // prior Rollup build. `neverBundle` is the 0.22 replacement for the deprecated `external`.
@@ -16,7 +19,7 @@ export default defineConfig({
       !id.startsWith('dotenv/') &&
       !id.startsWith('.') &&
       !id.startsWith('~') &&
-      !id.startsWith('/'),
+      !path.isAbsolute(id),
     // dotenv is bundled on purpose, so silence the "detected dependencies in bundle" hint.
     onlyBundle: false,
   },

@@ -7,7 +7,13 @@ import type {
   GoogleConfigOptions,
   GoogleCredentials,
 } from '~/types';
-import { isEnabled, loadServiceKey, checkUserKeyExpiry } from '~/utils';
+import {
+  isEnabled,
+  loadServiceKey,
+  checkUserKeyExpiry,
+  mergeHeaders,
+  resolveHeaders,
+} from '~/utils';
 import { getGoogleConfig } from './llm';
 
 /**
@@ -78,14 +84,35 @@ export async function initializeGoogle({
     clientOptions.titleModel = googleConfig.titleModel;
   }
 
-  if (allConfig) {
+  if (allConfig?.streamRate != null) {
     clientOptions.streamRate = allConfig.streamRate;
   }
+
+  /**
+   * Resolve configured Google headers at init (not at request time): the native
+   * Google auth header (`GOOGLE_AUTH_HEADER`) is built from the API key in
+   * `getGoogleConfig` and lives in the same `customHeaders` map. Resolving the
+   * admin templates here — before that key-derived header is added — keeps the
+   * key out of placeholder/env expansion (a user-provided `${ENV}` key can't leak
+   * server env) while still resolving admin headers (env, user, conversationId).
+   * `req.body` lacks the assistant message id at init, so `{{LIBRECHAT_BODY_MESSAGEID}}`
+   * is the one body placeholder unavailable here.
+   */
+  const mergedHeaders = mergeHeaders(allConfig?.headers, googleConfig?.headers);
+  const headers = mergedHeaders
+    ? resolveHeaders({
+        headers: mergedHeaders,
+        user: req.user,
+        body: req.body,
+        stripUnresolved: true,
+      })
+    : undefined;
 
   clientOptions = {
     reverseProxyUrl: GOOGLE_REVERSE_PROXY ?? undefined,
     authHeader: isEnabled(GOOGLE_AUTH_HEADER) ?? undefined,
     proxy: PROXY ?? undefined,
+    ...(headers && { headers }),
     modelOptions: model_parameters ?? {},
     forceVertex: isVertexEndpoint,
     projectId: isVertexEndpoint
@@ -97,5 +124,11 @@ export async function initializeGoogle({
     ...clientOptions,
   };
 
-  return getGoogleConfig(credentials, clientOptions);
+  const result = getGoogleConfig(credentials, clientOptions);
+
+  if (clientOptions.streamRate != null) {
+    result.llmConfig._lc_stream_delay = clientOptions.streamRate;
+  }
+
+  return result;
 }

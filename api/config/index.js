@@ -7,7 +7,6 @@ const {
   MCPServersRegistry,
   OAuthReconnectionManager,
 } = require('@librechat/api');
-const logger = require('./winston');
 
 global.EventSource = EventSource;
 
@@ -26,6 +25,8 @@ function getFlowStateManager(flowsCache) {
   if (!flowManager) {
     flowManager = new FlowStateManager(flowsCache, {
       ttl: mcpConfig.OAUTH_FLOW_TTL,
+      monitorTimeout: mcpConfig.OAUTH_HANDLING_TIMEOUT,
+      retainedFailureTypes: ['mcp_oauth'],
     });
   }
   return flowManager;
@@ -47,7 +48,6 @@ function getActionFlowStateManager(flowsCache) {
 }
 
 module.exports = {
-  logger,
   createMCPServersRegistry: MCPServersRegistry.createInstance,
   getMCPServersRegistry: MCPServersRegistry.getInstance,
   createMCPManager: MCPManager.createInstance,

@@ -145,6 +145,23 @@ describe('Conversation Utilities', () => {
       expect(grouped[1][1].length).toBe(1);
     });
 
+    it('excludes pinned conversations from date groups', () => {
+      const conversations = [
+        { conversationId: '1', updatedAt: new Date().toISOString(), pinned: true },
+        { conversationId: '2', updatedAt: new Date().toISOString() },
+        { conversationId: '3', updatedAt: '2023-06-01T12:00:00Z', pinned: true },
+        { conversationId: '4', updatedAt: '2023-06-01T12:00:00Z' },
+      ];
+
+      const grouped = groupConversationsByDate(conversations as TConversation[]);
+
+      const allGroupedIds = grouped.flatMap(([, convs]) => convs.map((c) => c.conversationId));
+      expect(allGroupedIds).not.toContain('1');
+      expect(allGroupedIds).not.toContain('3');
+      expect(allGroupedIds).toContain('2');
+      expect(allGroupedIds).toContain('4');
+    });
+
     it('correctly groups and sorts conversations for every month of the year', () => {
       const months = [
         'january',
@@ -636,6 +653,32 @@ describe('Conversation Utilities', () => {
         updateConvoInAllQueries(queryClient, 'a', (c) => ({ ...c, model: 'gpt-4' }));
         const data = queryClient.getQueryData<InfiniteData<any>>(['allConversations']);
         expect(data!.pages[0].conversations[0].model).toBe('gpt-4');
+      });
+
+      it('updateConvoInAllQueries keeps the derived isShared flag when a caller replaces the convo', () => {
+        updateConvoInAllQueries(queryClient, 'a', (c) => ({ ...c, isShared: true }));
+        // Rename/pin swap in a server payload that has no `isShared` field.
+        updateConvoInAllQueries(
+          queryClient,
+          'a',
+          () =>
+            ({
+              conversationId: 'a',
+              title: 'Renamed',
+            }) as TConversation,
+        );
+
+        const data = queryClient.getQueryData<InfiniteData<any>>(['allConversations']);
+        expect(data!.pages[0].conversations[0].title).toBe('Renamed');
+        expect(data!.pages[0].conversations[0].isShared).toBe(true);
+      });
+
+      it('updateConvoInAllQueries lets an explicit isShared value win over the cached one', () => {
+        updateConvoInAllQueries(queryClient, 'a', (c) => ({ ...c, isShared: true }));
+        updateConvoInAllQueries(queryClient, 'a', (c) => ({ ...c, isShared: false }));
+
+        const data = queryClient.getQueryData<InfiniteData<any>>(['allConversations']);
+        expect(data!.pages[0].conversations[0].isShared).toBe(false);
       });
 
       it('updateConvoInAllQueries with moveToTop moves convo to front and updates updatedAt', () => {

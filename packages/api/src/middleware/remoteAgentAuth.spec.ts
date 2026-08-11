@@ -23,6 +23,11 @@ jest.mock('~/utils', () => ({
   math: jest.fn(() => 60000),
 }));
 
+jest.mock('~/utils/proxy', () => ({
+  getEnvProxyDispatcher: jest.fn(),
+  getHttpsProxyAgent: jest.fn(),
+}));
+
 const mockGetSigningKey = jest.fn();
 const mockGetSigningKeys = jest.fn();
 
@@ -32,7 +37,6 @@ jest.mock('jwks-rsa', () =>
 
 jest.mock('undici', () => ({
   fetch: jest.fn(),
-  ProxyAgent: jest.fn((proxy: string) => ({ proxy })),
 }));
 
 jest.mock('jsonwebtoken', () => ({
@@ -48,16 +52,18 @@ jest.mock('../auth/openid', () => {
 import jwt from 'jsonwebtoken';
 import jwksRsa from 'jwks-rsa';
 import { SystemRoles } from 'librechat-data-provider';
-import { ProxyAgent, fetch as undiciFetch } from 'undici';
-import { logger, tenantStorage } from '@librechat/data-schemas';
+import { fetch as undiciFetch } from 'undici';
+import { getTenantId, logger, tenantStorage } from '@librechat/data-schemas';
 import { clearRemoteAgentAuthCache, createRemoteAgentAuth } from './remoteAgentAuth';
 import { findOpenIDUser, getOpenIdEmail } from '../auth/openid';
 import { isEnabled, math } from '~/utils';
+import { getEnvProxyDispatcher, getHttpsProxyAgent } from '~/utils/proxy';
 
 const mockFetch = undiciFetch as jest.Mock;
-const mockProxyAgent = ProxyAgent as unknown as jest.Mock;
 const mockMath = math as jest.Mock;
 const mockIsEnabled = isEnabled as jest.Mock;
+const mockGetEnvProxyDispatcher = getEnvProxyDispatcher as jest.Mock;
+const mockGetHttpsProxyAgent = getHttpsProxyAgent as jest.Mock;
 const realFindOpenIDUser =
   jest.requireActual<typeof import('../auth/openid')>('../auth/openid').findOpenIDUser;
 const mockFindOpenIDUser = findOpenIDUser as jest.MockedFunction<typeof findOpenIDUser>;
@@ -252,6 +258,8 @@ describe('createRemoteAgentAuth', () => {
     mockFetch.mockReset();
     mockMath.mockReturnValue(60000);
     mockIsEnabled.mockImplementation((value?: string) => value === 'true');
+    mockGetEnvProxyDispatcher.mockReturnValue(undefined);
+    mockGetHttpsProxyAgent.mockReturnValue(undefined);
     mockFindOpenIDUser.mockImplementation(realFindOpenIDUser);
     mockNext = jest.fn();
   });
@@ -387,6 +395,45 @@ describe('createRemoteAgentAuth', () => {
       expect(mockNext).toHaveBeenCalled();
     });
 
+    it('restores tenant context from the API key user before continuing', async () => {
+      const deps = makeDeps(makeConfig({}, { enabled: true }));
+      const req = makeReq();
+      let observedTenantId: string | undefined;
+      const next = jest.fn(() => {
+        observedTenantId = getTenantId();
+      });
+      deps.apiKeyMiddleware.mockImplementation((request: unknown, _res: unknown, next) => {
+        (request as Request).user = makeUser({ tenantId: 'tenant-api-key' });
+        next();
+      });
+
+      await createRemoteAgentAuth(asDeps(deps))(req as Request, makeRes().res, next);
+
+      expect(observedTenantId).toBe('tenant-api-key');
+      expect(next).toHaveBeenCalledWith();
+    });
+
+    it('preserves pre-auth tenant context for a tenantless API key user', async () => {
+      const deps = makeDeps(makeConfig({}, { enabled: true }));
+      const req = makeReq();
+      let observedTenantId: string | undefined;
+      const next = jest.fn(() => {
+        observedTenantId = getTenantId();
+      });
+      deps.apiKeyMiddleware.mockImplementation((request: unknown, _res: unknown, next) => {
+        (request as Request).user = makeUser({ tenantId: undefined });
+        next();
+      });
+
+      await tenantStorage.run({ tenantId: 'tenant-preauth' }, async () => {
+        await createRemoteAgentAuth(asDeps(deps))(req as Request, makeRes().res, next);
+      });
+
+      expect(observedTenantId).toBe('tenant-preauth');
+      expect(req).toMatchObject({ tenantId: 'tenant-preauth' });
+      expect(next).toHaveBeenCalledWith();
+    });
+
     it('returns 401 when apiKey is disabled and no token present', async () => {
       const deps = makeDeps(makeConfig({}, { enabled: false }));
       const { res, status, json } = makeRes();
@@ -436,6 +483,67 @@ describe('createRemoteAgentAuth', () => {
       );
       expect(mockNext).toHaveBeenCalledWith();
       expect(deps.apiKeyMiddleware).not.toHaveBeenCalled();
+    });
+
+    it('restores tenant context from the OIDC user before continuing', async () => {
+      setupOidcMocks({ sub: 'sub123', email: 'agent@test.com' });
+      const deps = makeDeps();
+      deps.findUser = makeFindUser(makeUser({ tenantId: 'tenant-oidc' }));
+      const req = makeReq({ authorization: `Bearer ${FAKE_TOKEN}` });
+      let observedTenantId: string | undefined;
+      const next = jest.fn(() => {
+        observedTenantId = getTenantId();
+      });
+
+      await createRemoteAgentAuth(asDeps(deps))(req as Request, makeRes().res, next);
+
+      expect(observedTenantId).toBe('tenant-oidc');
+      expect(next).toHaveBeenCalledWith();
+    });
+
+    it('preserves pre-auth tenant context for a tenantless OIDC user', async () => {
+      setupOidcMocks({ sub: 'sub123', email: 'agent@test.com' });
+      const deps = makeDeps();
+      const req = makeReq({ authorization: `Bearer ${FAKE_TOKEN}` });
+      let observedTenantId: string | undefined;
+      const next = jest.fn(() => {
+        observedTenantId = getTenantId();
+      });
+
+      await tenantStorage.run({ tenantId: 'tenant-preauth' }, async () => {
+        await createRemoteAgentAuth(asDeps(deps))(req as Request, makeRes().res, next);
+      });
+
+      expect(observedTenantId).toBe('tenant-preauth');
+      expect(req).toMatchObject({ tenantId: 'tenant-preauth' });
+      expect(next).toHaveBeenCalledWith();
+    });
+
+    it('rejects a tenant context that conflicts with the resolved OIDC user', async () => {
+      setupOidcMocks({ sub: 'sub123', email: 'agent@test.com' });
+      const deps = makeDeps();
+      deps.findUser = makeFindUser(
+        makeUser({
+          tenantId: 'tenant-user',
+          provider: undefined,
+          openidId: undefined,
+          openidIssuer: undefined,
+        }),
+      );
+      const { res, status, json } = makeRes();
+
+      await tenantStorage.run({ tenantId: 'tenant-request' }, async () => {
+        await createRemoteAgentAuth(asDeps(deps))(
+          makeReq({ authorization: `Bearer ${FAKE_TOKEN}` }) as Request,
+          res,
+          mockNext,
+        );
+      });
+
+      expect(status).toHaveBeenCalledWith(401);
+      expect(json).toHaveBeenCalledWith({ error: 'Unauthorized' });
+      expect(deps.updateUser).not.toHaveBeenCalled();
+      expect(mockNext).not.toHaveBeenCalled();
     });
 
     it('re-evaluates OIDC auth config after resolving the user tenant', async () => {
@@ -1091,8 +1199,9 @@ describe('createRemoteAgentAuth', () => {
       expect(mockNext).not.toHaveBeenCalled();
     });
 
-    it('uses a proxy agent for discovery when PROXY is set', async () => {
-      process.env.PROXY = 'http://proxy.example.com';
+    it('uses a proxy dispatcher for discovery when configured', async () => {
+      const proxyDispatcher = { dispatch: jest.fn() };
+      mockGetEnvProxyDispatcher.mockReturnValue(proxyDispatcher);
       const issuer = 'https://issuer-proxy.example.com';
 
       mockFetch.mockResolvedValue({
@@ -1108,10 +1217,9 @@ describe('createRemoteAgentAuth', () => {
         mockNext,
       );
 
-      expect(mockProxyAgent).toHaveBeenCalledWith('http://proxy.example.com');
       expect(mockFetch).toHaveBeenCalledWith(
         `${issuer}/.well-known/openid-configuration`,
-        expect.objectContaining({ dispatcher: { proxy: 'http://proxy.example.com' } }),
+        expect.objectContaining({ dispatcher: proxyDispatcher }),
       );
     });
 

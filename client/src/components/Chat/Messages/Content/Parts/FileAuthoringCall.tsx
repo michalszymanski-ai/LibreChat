@@ -8,6 +8,7 @@ import useLazyHighlight from './useLazyHighlight';
 import CodeWindowHeader from './CodeWindowHeader';
 import { AttachmentGroup } from './Attachment';
 import { langFromPath } from './ReadFileCall';
+import { useToolCallIntent } from './intent';
 import { useLocalize } from '~/hooks';
 import { cn } from '~/utils';
 
@@ -123,7 +124,12 @@ export default function FileAuthoringCall({
 }) {
   const localize = useLocalize();
   const isCreate = toolName === 'create_file';
+  /** `create_file` can overwrite an existing file (sandbox `overwrite: true`,
+   *  or skill SKILL.md updates). The host-authored summary always opens with
+   *  `Created`/`Updated`, so key the finished label off it for truthfulness. */
+  const overwrote = isCreate && output.startsWith('Updated ');
   const filePath = useMemo(() => parseJsonField(args, 'file_path'), [args]);
+  const intent = useToolCallIntent(args);
   const authoredContent = useMemo(() => parseJsonField(args, 'content'), [args]);
   const editArgsPreview = useMemo(() => buildEditArgsPreview(args), [args]);
   const fileName = filePath.split('/').pop() || filePath;
@@ -145,21 +151,29 @@ export default function FileAuthoringCall({
     useToolCallState(initialProgress, isSubmitting, output, !!filePath || !!preview, onExpand);
 
   const highlighted = useLazyHighlight(preview || undefined, previewLang);
-  const Icon = isCreate ? FilePlus2 : FilePenLine;
+  const Icon = isCreate && !overwrote ? FilePlus2 : FilePenLine;
+  let finishedKey: 'com_ui_created_file' | 'com_ui_updated_file' | 'com_ui_edited_file' =
+    'com_ui_edited_file';
+  if (isCreate) {
+    finishedKey = overwrote ? 'com_ui_updated_file' : 'com_ui_created_file';
+  }
 
   return (
     <>
-      <div className="relative my-1.5 flex size-5 shrink-0 items-center gap-2.5">
+      <div className="relative my-1.5 flex h-5 shrink-0 items-center gap-2.5">
         <ProgressText
           progress={progress}
           onClick={toggleCode}
-          inProgressText={localize(isCreate ? 'com_ui_creating_file' : 'com_ui_editing_file', {
-            0: fileName,
-          })}
+          inProgressText={
+            intent ??
+            localize(isCreate ? 'com_ui_creating_file' : 'com_ui_editing_file', {
+              0: fileName,
+            })
+          }
           finishedText={
             cancelled
               ? localize('com_ui_cancelled')
-              : localize(isCreate ? 'com_ui_created_file' : 'com_ui_edited_file', { 0: fileName })
+              : (intent ?? localize(finishedKey, { 0: fileName }))
           }
           errorSuffix={hasError && !cancelled ? localize('com_ui_tool_failed') : undefined}
           icon={
@@ -190,7 +204,7 @@ export default function FileAuthoringCall({
                 <pre
                   className={cn(
                     'max-h-[300px] overflow-auto whitespace-pre-wrap break-words border-t border-border-light px-3 py-2.5 font-mono text-xs',
-                    hasError ? 'text-red-600 dark:text-red-400' : 'text-text-primary',
+                    hasError ? 'text-status-error' : 'text-text-primary',
                   )}
                 >
                   {output}

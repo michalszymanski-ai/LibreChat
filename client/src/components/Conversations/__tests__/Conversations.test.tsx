@@ -3,6 +3,9 @@ import { render } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { RecoilRoot } from 'recoil';
 import type { CellMeasurerCache, List } from 'react-virtualized';
+import type { TConversation } from 'librechat-data-provider';
+import Conversations from '../Conversations';
+import store from '~/store';
 
 let mockCapturedCache: CellMeasurerCache | null = null;
 
@@ -43,15 +46,11 @@ jest.mock('react-virtualized', () => {
 });
 
 jest.mock('~/store', () => {
-  const { atom, atomFamily } = jest.requireActual('recoil');
+  const { atom } = jest.requireActual('recoil');
   return {
     __esModule: true,
     default: {
       search: atom({ key: 'test-conversations-search', default: { query: '' } }),
-      conversationByIndex: atomFamily({
-        key: 'test-conversations-convo-by-index',
-        default: null,
-      }),
     },
   };
 });
@@ -69,20 +68,13 @@ jest.mock('~/hooks', () => ({
   useFavorites: () => mockFavoritesState,
   useLocalize: () => (key: string) => key,
   useShowMarketplace: () => mockShowMarketplace,
-  useNewConvo: () => ({ newConversation: jest.fn() }),
   useElementSize: () => ({ ref: jest.fn(), width: 300, height: 600 }),
   TranslationKeys: {},
-}));
-
-jest.mock('@tanstack/react-query', () => ({
-  useQueryClient: () => ({ invalidateQueries: jest.fn() }),
 }));
 
 jest.mock('@librechat/client', () => ({
   Spinner: () => <div data-testid="spinner" />,
   useMediaQuery: () => false,
-  TooltipAnchor: ({ render }: { render: React.ReactNode }) => render,
-  NewChatIcon: () => <svg data-testid="new-chat-icon" />,
 }));
 
 jest.mock('~/data-provider', () => ({
@@ -91,7 +83,6 @@ jest.mock('~/data-provider', () => ({
 
 jest.mock('~/utils', () => ({
   groupConversationsByDate: () => [],
-  clearMessagesCache: jest.fn(),
   cn: (...args: unknown[]) => args.filter(Boolean).join(' '),
 }));
 
@@ -104,8 +95,6 @@ jest.mock('../Convo', () => ({
   __esModule: true,
   default: () => <div data-testid="convo" />,
 }));
-
-import Conversations from '../Conversations';
 
 describe('Conversations – favorites CellMeasurerCache key invalidation', () => {
   const containerRef = createRef<List>();
@@ -189,5 +178,72 @@ describe('Conversations – favorites CellMeasurerCache key invalidation', () =>
 
     expect(cache.has(0, 0)).toBe(true);
     expect(cache.getHeight(0, 0)).toBe(88);
+  });
+});
+
+const pinnedConvo = {
+  conversationId: 'pinned-1',
+  title: 'Pinned Chat',
+  pinned: true,
+  endpoint: 'openAI',
+  createdAt: new Date().toISOString(),
+  updatedAt: new Date().toISOString(),
+} as TConversation;
+
+describe('Conversations – pinned header', () => {
+  const containerRef = createRef<List>();
+
+  beforeEach(() => {
+    mockCapturedCache = null;
+    mockFavoritesState.favorites = [];
+    mockFavoritesState.isLoading = false;
+    mockShowMarketplace = false;
+  });
+
+  const renderConversations = (conversations: TConversation[], searchQuery = '') =>
+    render(
+      <RecoilRoot
+        initializeState={({ set }) => {
+          set(store.search, {
+            query: searchQuery,
+            enabled: true,
+            debouncedQuery: searchQuery,
+            isSearching: true,
+            isTyping: false,
+          });
+        }}
+      >
+        <Conversations
+          conversations={conversations}
+          moveToTop={jest.fn()}
+          toggleNav={jest.fn()}
+          containerRef={containerRef}
+          loadMoreConversations={jest.fn()}
+          isLoading={false}
+          isSearchLoading={false}
+          isChatsExpanded={true}
+          setIsChatsExpanded={jest.fn()}
+        />
+      </RecoilRoot>,
+    );
+
+  it('shows the pinned header when there are pinned conversations', () => {
+    const { getByText } = renderConversations([pinnedConvo]);
+    expect(getByText('com_ui_pinned')).toBeInTheDocument();
+  });
+
+  it('does not show the pinned header when there are no pinned conversations', () => {
+    const { queryByText } = renderConversations([]);
+    expect(queryByText('com_ui_pinned')).not.toBeInTheDocument();
+  });
+
+  it('does not show the pinned header during search', () => {
+    const { queryByText } = renderConversations([pinnedConvo], 'some query');
+    expect(queryByText('com_ui_pinned')).not.toBeInTheDocument();
+  });
+
+  it('does not render a duplicate new chat button in the chats header', () => {
+    const { queryByRole } = renderConversations([]);
+    expect(queryByRole('button', { name: 'com_ui_new_chat' })).not.toBeInTheDocument();
   });
 });
