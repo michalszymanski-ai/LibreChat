@@ -151,8 +151,10 @@ librechat:
       business-cards:
         type: streamable-http
         url: https://business-cards-mcp.wittygrass-e1b1e1df.swedencentral.azurecontainerapps.io/mcp
-        headers:
-          Authorization: "Bearer ${BUSINESS_CARDS_MCP_API_KEY}"
+        apiKey:
+          key: "${BUSINESS_CARDS_MCP_API_KEY}"
+          source: admin
+          authorization_type: bearer
         chatMenu: true
         serverInstructions: true
         timeout: 120000
