@@ -156,7 +156,7 @@ librechat:
         chatMenu: true
         serverInstructions: true
         timeout: 120000
-        initTimeout: 120000
+        initTimeout: 240000
     fileConfig:
       endpoints:
         default:
