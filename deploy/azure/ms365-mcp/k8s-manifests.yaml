@@ -36,7 +36,7 @@ spec:
               value: "^(?!list-mail-rules|get-mailbox-settings|list-outlook-categories).*(mail|attachment|draft|calendar|event|contact)"
             # Public URL for OAuth redirects (proxied through billechat domain)
             - name: MS365_MCP_PUBLIC_URL
-              value: "https://billechat.135-225-229-32.nip.io/ms365-mcp"
+              value: "https://billechat.billennium.com/ms365-mcp"
           resources:
             requests:
               cpu: 100m
@@ -88,8 +88,19 @@ spec:
   tls:
     - secretName: billechat-tls
       hosts:
+        - billechat.billennium.com
         - billechat.135-225-229-32.nip.io
   rules:
+    - host: billechat.billennium.com
+      http:
+        paths:
+          - path: /ms365-mcp(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: ms365-mcp-server
+                port:
+                  number: 3000
     - host: billechat.135-225-229-32.nip.io
       http:
         paths:
@@ -118,8 +129,19 @@ spec:
   tls:
     - secretName: billechat-tls
       hosts:
+        - billechat.billennium.com
         - billechat.135-225-229-32.nip.io
   rules:
+    - host: billechat.billennium.com
+      http:
+        paths:
+          - path: /.well-known/oauth-authorization-server/ms365-mcp
+            pathType: Exact
+            backend:
+              service:
+                name: ms365-mcp-server
+                port:
+                  number: 3000
     - host: billechat.135-225-229-32.nip.io
       http:
         paths:

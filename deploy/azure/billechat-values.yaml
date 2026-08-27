@@ -34,8 +34,8 @@ librechat:
     DEBUG_LOGGING: "false"
 
     # Domain
-    DOMAIN_CLIENT: "https://billechat.135-225-229-32.nip.io"
-    DOMAIN_SERVER: "https://billechat.135-225-229-32.nip.io"
+    DOMAIN_CLIENT: "https://billechat.billennium.com"
+    DOMAIN_SERVER: "https://billechat.billennium.com"
 
     # Branding
     APP_TITLE: "BilleChat"
@@ -82,7 +82,7 @@ librechat:
     OPENID_ISSUER: "https://login.microsoftonline.com/3912aa95-6d78-446d-8548-a49ffd73f550/v2.0"
     OPENID_SCOPE: "openid profile email offline_access api://f0aa5392-50f1-4319-9c10-4c817490bfd9/access_as_user"
     OPENID_CALLBACK_URL: "/oauth/openid/callback"
-    OPENID_REDIRECT_URI: "https://billechat.135-225-229-32.nip.io/oauth/openid/callback"
+    OPENID_REDIRECT_URI: "https://billechat.billennium.com/oauth/openid/callback"
     OPENID_EMAIL_CLAIM: "upn"
     OPENID_BUTTON_LABEL: "Sign in with Billennium"
     OPENID_REUSE_TOKENS: "true"
@@ -139,7 +139,7 @@ librechat:
         serverInstructions: true
       # Microsoft 365 MCP — Outlook, Calendar, Teams, OneDrive, SharePoint, etc.
       # Uses OAuth 2.1 (browser-based login). Deployed as a sidecar service in the cluster.
-      # Public URL: https://ms365-mcp.135-225-229-32.nip.io
+      # Public OAuth URL: https://billechat.billennium.com/ms365-mcp
       # If OAuth per-user is not desired, have an Azure AD admin grant tenant-wide consent:
       #   https://login.microsoftonline.com/3912aa95-6d78-446d-8548-a49ffd73f550/adminconsent?client_id=<MS365_MCP_APP_CLIENT_ID>
       ms365:
@@ -208,6 +208,10 @@ ingress:
     nginx.ingress.kubernetes.io/websocket-services: billechat-librechat
     nginx.ingress.kubernetes.io/proxy-http-version: "1.1"
   hosts:
+    - host: billechat.billennium.com
+      paths:
+        - path: /
+          pathType: Prefix
     - host: billechat.135-225-229-32.nip.io
       paths:
         - path: /
@@ -215,6 +219,7 @@ ingress:
   tls:
     - secretName: billechat-tls
       hosts:
+        - billechat.billennium.com
         - billechat.135-225-229-32.nip.io
 
 # Resources
