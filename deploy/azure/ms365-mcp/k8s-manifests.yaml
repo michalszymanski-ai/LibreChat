@@ -89,19 +89,8 @@ spec:
     - secretName: billechat-tls
       hosts:
         - billechat.billennium.com
-        - billechat.135-225-229-32.nip.io
   rules:
     - host: billechat.billennium.com
-      http:
-        paths:
-          - path: /ms365-mcp(/|$)(.*)
-            pathType: ImplementationSpecific
-            backend:
-              service:
-                name: ms365-mcp-server
-                port:
-                  number: 3000
-    - host: billechat.135-225-229-32.nip.io
       http:
         paths:
           - path: /ms365-mcp(/|$)(.*)
@@ -130,19 +119,8 @@ spec:
     - secretName: billechat-tls
       hosts:
         - billechat.billennium.com
-        - billechat.135-225-229-32.nip.io
   rules:
     - host: billechat.billennium.com
-      http:
-        paths:
-          - path: /.well-known/oauth-authorization-server/ms365-mcp
-            pathType: Exact
-            backend:
-              service:
-                name: ms365-mcp-server
-                port:
-                  number: 3000
-    - host: billechat.135-225-229-32.nip.io
       http:
         paths:
           - path: /.well-known/oauth-authorization-server/ms365-mcp

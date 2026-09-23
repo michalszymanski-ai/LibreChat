@@ -5,14 +5,34 @@ Deploy LibreChat (billechat branch) to Azure Kubernetes Service.
 ## Architecture
 
 ```
-Internet → billechat.billennium.com
+Internet → billechat.billennium.com (A → 9.223.181.253, static IP billechat-ingress-pip)
          → Azure Load Balancer
          → NGINX Ingress (TLS via Let's Encrypt)
          → LibreChat Pod (AKS)
              ├── MongoDB (subchart)
              ├── Meilisearch (subchart)
-             └── RAG API + PgVector (subchart)
+             ├── RAG API + PgVector (subchart)
+             ├── Code Interpreter (codeapi, KVM sandbox)
+             └── MCP servers (ms365, primetric)
 ```
+
+## Current Environment
+
+| | |
+|---|---|
+| Subscription | `BL-TRANSFORMATION-POC` (`b9ac4560-bf0d-41cb-b3e7-1a27bd71ae5d`) |
+| Resource group | `billechat-rg` (swedencentral): AKS, ACR `billechatacr`, storage `stbillechatfiles`, Key Vault `kv-billechat`, ingress IP |
+| AKS | `billechat-aks`, k8s 1.34, one `Standard_D4as_v5` node (pool `system`, max 110 pods) |
+| Ingress IP | `9.223.181.253` (static, survives ingress/cluster rebuilds) |
+| Outbound IP | `57.174.174.79` (allowlist this on external services) |
+
+Moved from `BL-AI_DATA_POC` in September 2026. AKS clusters can't change
+subscription, so the cluster was rebuilt and its disks copied via snapshots;
+ACR, storage and Key Vault were moved with `az resource move`.
+
+The single node is the floor for this workload: the six Azure Disk PVCs rule
+out 2-vCPU sizes (4 data disks max), and codeapi needs nested virtualization
+(`/dev/kvm`). CPU requests follow observed idle usage; limits allow bursts.
 
 ## Prerequisites
 
@@ -32,13 +52,24 @@ chmod +x deploy/azure/setup-infrastructure.sh
 This creates:
 - Resource Group (`billechat-rg`)
 - Azure Container Registry (`billechatacr`)
-- AKS cluster (`billechat-aks`, 2x Standard_D4s_v5)
+- AKS cluster (`billechat-aks`, 1x Standard_D4as_v5)
+- Static public IP for the ingress (`billechat-ingress-pip`)
 - NGINX Ingress Controller
 - cert-manager with Let's Encrypt
 
+Then mirror the pinned third-party images into ACR:
+
+```bash
+./deploy/azure/mirror-images.sh
+```
+
+MongoDB, Redis, PgVector, MinIO and the RAG API are pulled from
+`billechatacr.azurecr.io/mirror/*` by digest, because Bitnami's free
+`latest` tags move between major versions and `bitnamilegacy` may disappear.
+
 ### 2. Configure DNS
 
-Point an A record for `billechat.billennium.com` to the Ingress external IP printed by the setup script.
+Point an A record for `billechat.billennium.com` to the static ingress IP printed by the setup script (currently `9.223.181.253`).
 
 ### 3. Set Up GitHub Actions Secrets
 

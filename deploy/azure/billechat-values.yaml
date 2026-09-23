@@ -15,6 +15,11 @@ image:
   tag: latest
 
 global:
+  # Third-party images are pulled from billechatacr mirrors (see
+  # deploy/azure/mirror-images.sh); the Bitnami charts reject non-Bitnami
+  # repositories unless this is set.
+  security:
+    allowInsecureImages: true
   librechat:
     # All sensitive env vars (API keys, JWT/CREDS, OpenID secrets, storage
     # connection string) live in this Secret, maintained out-of-band in the
@@ -212,20 +217,17 @@ ingress:
       paths:
         - path: /
           pathType: Prefix
-    - host: billechat.135-225-229-32.nip.io
-      paths:
-        - path: /
-          pathType: Prefix
   tls:
     - secretName: billechat-tls
       hosts:
         - billechat.billennium.com
-        - billechat.135-225-229-32.nip.io
 
 # Resources
+# Requests are sized to the single-node cluster (observed idle ~2m CPU);
+# limits leave room for bursts.
 resources:
   requests:
-    cpu: 500m
+    cpu: 250m
     memory: 1Gi
   limits:
     cpu: 2000m
@@ -258,10 +260,20 @@ securityContext:
 # MongoDB (subchart)
 mongodb:
   enabled: true
+  # Bitnami's free `latest` tag keeps moving; this pins the MongoDB 8.3.11
+  # build the data files were written with.
   image:
-    registry: docker.io
-    repository: bitnami/mongodb
-    tag: latest
+    registry: billechatacr.azurecr.io
+    repository: mirror/bitnami-mongodb
+    tag: "8.3.11"
+    digest: "sha256:e46cffb6627482d0c1e1769746d938c0b926e8ca0a0ddea55c6b58c2bae3eb26"
+  resources:
+    requests:
+      cpu: 200m
+      memory: 512Mi
+    limits:
+      cpu: 750m
+      memory: 768Mi
   updateStrategy:
     type: Recreate
     rollingUpdate: null
@@ -296,11 +308,16 @@ librechat-rag-api:
       AZURE_OPENAI_ENDPOINT: "https://micha-mm146vwy-swedencentral.services.ai.azure.com"
       OPENAI_API_VERSION: "2024-12-01-preview"
   image:
-    repository: danny-avila/librechat-rag-api-dev-lite
-    registry: registry.librechat.ai
-    tag: latest
+    registry: billechatacr.azurecr.io
+    repository: mirror/librechat-rag-api-dev-lite
+    tag: "f9f34c8"
   postgresql:
     enabled: true
+    image:
+      registry: billechatacr.azurecr.io
+      repository: mirror/bitnami-pgvector
+      tag: "pg16-19ebe07"
+      digest: "sha256:19ebe07b4dafb9fe5e757e0099947be9fd35d209d4ff371022180419053d426f"
     auth:
       existingSecret: "librechat-vectordb"
       database: librechat-vectordb

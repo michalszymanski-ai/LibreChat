@@ -16,6 +16,10 @@ permissions:
 
 env:
   ACR_NAME: billechatacr
+  # BL-TRANSFORMATION-POC. Pinned here because azure/login ignores `creds` when
+  # a subscription-id input is also set, and AZURE_CREDENTIALS still names the
+  # subscription the cluster was created in.
+  AZURE_SUBSCRIPTION_ID: b9ac4560-bf0d-41cb-b3e7-1a27bd71ae5d
   AKS_CLUSTER: billechat-aks
   RESOURCE_GROUP: billechat-rg
   NAMESPACE: billechat
@@ -68,6 +72,7 @@ jobs:
       - name: Set AKS context
         uses: azure/aks-set-context@v3
         with:
+          subscription: ${{ env.AZURE_SUBSCRIPTION_ID }}
           resource-group: ${{ env.RESOURCE_GROUP }}
           cluster-name: ${{ env.AKS_CLUSTER }}
 

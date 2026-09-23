@@ -7,12 +7,17 @@
 # (see deploy/azure/README.md) or from the pre-created `codeapi-jwt-verifier`
 # secret for the LibreChat verifier key.
 #
-# Sizing note: the cluster is 2x Standard_D4s_v5 (3860m allocatable CPU each)
-# already running LibreChat, Mongo, Postgres, Meilisearch and two MCP servers,
-# so every component runs a single replica.
+# Sizing note: the cluster is a single Standard_D4as_v5 node (3860m allocatable
+# CPU) shared with LibreChat, Mongo, Postgres, Meilisearch and two MCP servers,
+# so every component runs a single replica and CPU requests track observed idle
+# usage while limits allow bursts.
 
 global:
   storageClass: managed-csi
+  # Redis/MinIO come from billechatacr mirrors (deploy/azure/mirror-images.sh);
+  # the Bitnami charts reject non-Bitnami repositories unless this is set.
+  security:
+    allowInsecureImages: true
 
 hardenedSandboxMode: true
 
@@ -63,7 +68,7 @@ workerSandbox:
     repository: billechatacr.azurecr.io/codeapi-sandbox-runner
     tag: latest
     pullPolicy: IfNotPresent
-  # Nodes are Standard_D4s_v5 and expose /dev/kvm with vmx, so the sandbox runs
+  # Nodes are Standard_D4as_v5 and expose /dev/kvm (AMD svm), so the sandbox runs
   # under its own guest kernel with NsJail inside rather than sharing the host.
   kvmEnabled: true
   # A hostPath mount leaves the device cgroup closed for non-privileged
@@ -77,7 +82,7 @@ workerSandbox:
     ramMib: 2048
   resources:
     requests:
-      cpu: 500m
+      cpu: 150m
       memory: 1Gi
     limits:
       cpu: 1500m
@@ -130,7 +135,20 @@ redis:
   architecture: standalone
   auth:
     enabled: true
+  # Bitnami's free `latest` tag keeps moving; this pins Redis 8.10.1.
+  image:
+    registry: billechatacr.azurecr.io
+    repository: mirror/bitnami-redis
+    tag: "8.10.1"
+    digest: "sha256:ffa455a3ad00bccc24dfde113ef55329dde687da242e9feb6ccd2b30eb93e8f3"
   master:
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        cpu: 150m
+        memory: 192Mi
     persistence:
       enabled: true
       size: 1Gi
@@ -139,17 +157,36 @@ minio:
   enabled: true
   mode: standalone
   # Bitnami retired its public Docker Hub catalog, so the tags this chart pins
-  # only resolve under bitnamilegacy.
+  # only resolve under bitnamilegacy; the long-running images are mirrored into
+  # billechatacr in case bitnamilegacy disappears too.
   image:
-    registry: docker.io
-    repository: bitnamilegacy/minio
+    registry: billechatacr.azurecr.io
+    repository: mirror/bitnami-minio
+    tag: "2025.7.23-debian-12-r3"
+    digest: "sha256:953d489a81cc4de7975f90e07202189c4325da39b0b92470b6a13c7ea99e36cd"
+  resources:
+    requests:
+      cpu: 50m
+      memory: 256Mi
+    limits:
+      cpu: 375m
+      memory: 384Mi
   clientImage:
     registry: docker.io
     repository: bitnamilegacy/minio-client
   console:
     image:
-      registry: docker.io
-      repository: bitnamilegacy/minio-object-browser
+      registry: billechatacr.azurecr.io
+      repository: mirror/bitnami-minio-object-browser
+      tag: "2.0.2-debian-12-r3"
+      digest: "sha256:4ca163354c4f4e2cf87a0c6cf668f47d07f7f176b53d9bd4bd16b81df62b2763"
+    resources:
+      requests:
+        cpu: 10m
+        memory: 128Mi
+      limits:
+        cpu: 150m
+        memory: 192Mi
   defaultInitContainers:
     volumePermissions:
       image:
