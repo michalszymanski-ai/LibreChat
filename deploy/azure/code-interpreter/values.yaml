@@ -1,6 +1,8 @@
 # Self-hosted Code Interpreter (codeapi) for BilleChat on AKS.
 #
-# Upstream chart: ClickHouse/code-interpreter, helm/codeapi
+# Upstream chart: ClickHouse/code-interpreter, helm/codeapi at 18bf002 plus
+# 3946ffb (egress gateway waits for Redis; without it the gateway's Redis client
+# gives up after ~10 s at startup and stays unready until restarted).
 # Images are built by .github/workflows/codeapi-images.yml into billechatacr.
 #
 # Secrets are NOT stored here. They are applied via `--set` from GitHub secrets

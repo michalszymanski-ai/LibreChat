@@ -54,7 +54,7 @@ librechat:
 
     # Anthropic via Azure AI Foundry (deployment names == model ids on the Foundry)
     ANTHROPIC_REVERSE_PROXY: "https://micha-mm146vwy-swedencentral.services.ai.azure.com/anthropic"
-    ANTHROPIC_MODELS: "claude-opus-5,claude-fable-5,claude-opus-4-8,claude-opus-4-7,claude-opus-4-6"
+    ANTHROPIC_MODELS: "claude-opus-5,claude-fable-5,claude-opus-4-8,claude-opus-4-7"
 
     # RAG
     RAG_OPENAI_BASEURL: "https://micha-mm146vwy-swedencentral.services.ai.azure.com/openai"
@@ -182,6 +182,8 @@ librechat:
     memory:
       personalize: true
       agent:
+        # Automatic memory extraction is opt-in since v0.8.8-rc4.
+        enabled: true
         provider: "azureOpenAI"
         model: "gpt-5-chat"
 

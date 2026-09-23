@@ -30,6 +30,10 @@ Moved from `BL-AI_DATA_POC` in September 2026. AKS clusters can't change
 subscription, so the cluster was rebuilt and its disks copied via snapshots;
 ACR, storage and Key Vault were moved with `az resource move`.
 
+LibreChat v0.8.8-rc4 and later refuse to start with the retired default
+`JWT_SECRET`/`JWT_REFRESH_SECRET`, so both are unique values in the
+`billechat-librechat-env` Secret; rotating them signs every user out once.
+
 The single node is the floor for this workload: the six Azure Disk PVCs rule
 out 2-vCPU sizes (4 data disks max), and codeapi needs nested virtualization
 (`/dev/kvm`). CPU requests follow observed idle usage; limits allow bursts.
