@@ -32,6 +32,7 @@ interface MeiliIndexable {
   _meiliIndex?: boolean;
   _meiliIndexAttempted?: boolean;
   _meiliIndexVersion?: string;
+  _meiliIndexSchemaVersion?: number;
   _meiliCleanupVersion?: number;
 }
 
@@ -48,6 +49,7 @@ interface _DocumentWithMeiliIndex extends Document {
   _meiliIndex?: boolean;
   _meiliIndexAttempted?: boolean;
   _meiliIndexVersion?: string;
+  _meiliIndexSchemaVersion?: number;
   _meiliCleanupVersion?: number;
   isTemporary?: boolean;
   expiredAt?: Date | null;
@@ -106,6 +108,9 @@ const getSyncConfig = () => ({
 
 const hasSchemaPath = (schema: Schema, path: string): boolean =>
   Object.prototype.hasOwnProperty.call(schema.obj, path);
+
+/** Bump when the indexed document shape or projection changes. */
+export const MEILI_INDEX_SCHEMA_VERSION = 1;
 
 const explicitTemporaryFlagKey = 'meiliExplicitTemporaryFlag';
 const previouslyIndexedFlagKey = 'meiliPreviouslyIndexed';
@@ -181,7 +186,16 @@ const buildIndexableQuery = (
   };
 };
 
-const buildExcludedIndexedQuery = (excludeFromIndexPath?: string): FilterQuery<unknown> | null => {
+/**
+ * Excluded documents that may still hold a Meili entry. The legacy branch matches a
+ * `_meiliCleanupVersion` that is absent or null, written as a null equality rather than
+ * `$exists: false` so `meili_excluded_legacy_cleanup_v4` can serve it: a partial index
+ * accepts null equality and rejects `$exists: false`, and the planner only reaches a
+ * partial index through a predicate that implies its filter.
+ */
+export const buildExcludedIndexedQuery = (
+  excludeFromIndexPath?: string,
+): FilterQuery<unknown> | null => {
   if (excludeFromIndexPath == null) {
     return null;
   }
@@ -191,7 +205,7 @@ const buildExcludedIndexedQuery = (excludeFromIndexPath?: string): FilterQuery<u
     $or: [
       { _meiliIndex: true },
       { _meiliIndexAttempted: true },
-      { _meiliIndex: false, _meiliCleanupVersion: { $exists: false } },
+      { _meiliIndex: false, _meiliCleanupVersion: null },
     ],
   };
 };
@@ -304,6 +318,7 @@ const createMeiliMongooseModel = ({
       '+_meiliIndex',
       '+_meiliIndexAttempted',
       '+_meiliIndexVersion',
+      '+_meiliIndexSchemaVersion',
       'isTemporary',
       'expiredAt',
       'unfinished',
@@ -378,7 +393,13 @@ const createMeiliMongooseModel = ({
         // eslint-disable-next-line no-restricted-syntax -- versioned internal bookkeeping must not re-enter document middleware
         const acknowledgement = await doc.collection.updateOne(
           { _id: doc._id as Types.ObjectId, _meiliIndexVersion: version },
-          { $set: { _meiliIndex: true, _meiliCleanupVersion: meiliCleanupVersion } },
+          {
+            $set: {
+              _meiliIndex: true,
+              _meiliCleanupVersion: meiliCleanupVersion,
+              _meiliIndexSchemaVersion: MEILI_INDEX_SCHEMA_VERSION,
+            },
+          },
         );
         if (acknowledgement.matchedCount > 0) {
           return;
@@ -412,36 +433,49 @@ const createMeiliMongooseModel = ({
     static async getSyncProgress(this: SchemaWithMeiliMethods): Promise<SyncProgress> {
       const indexableQuery = getIndexableQuery();
       const excludedIndexedQuery = getExcludedIndexedQuery();
-      const [totalDocuments, indexedDocuments, pendingIndexing, pendingCleanup] = await Promise.all(
-        [
-          this.countDocuments(indexableQuery),
-          this.countDocuments({
-            ...indexableQuery,
-            _meiliIndex: true,
-          }),
-          this.countDocuments({
-            ...indexableQuery,
-            _meiliIndex: { $ne: true },
-            _meiliIndexAttempted: true,
-          }),
-          excludedIndexedQuery == null
-            ? Promise.resolve(0)
-            : this.countDocuments(excludedIndexedQuery),
+      const needsIndexingQuery: FilterQuery<unknown> = {
+        $and: [
+          indexableQuery,
+          {
+            $or: [
+              { _meiliIndex: { $ne: true }, _meiliIndexAttempted: true },
+              {
+                _meiliIndex: true,
+                _meiliIndexSchemaVersion: { $ne: MEILI_INDEX_SCHEMA_VERSION },
+              },
+            ],
+          },
         ],
-      );
+      };
+      const [totalDocuments, totalProcessed, pendingIndexing, pendingCleanup] = await Promise.all([
+        this.countDocuments(indexableQuery),
+        this.countDocuments({
+          $and: [
+            indexableQuery,
+            {
+              _meiliIndex: true,
+              _meiliIndexSchemaVersion: MEILI_INDEX_SCHEMA_VERSION,
+            },
+          ],
+        }),
+        this.countDocuments(needsIndexingQuery),
+        excludedIndexedQuery == null
+          ? Promise.resolve(0)
+          : this.countDocuments(excludedIndexedQuery),
+      ]);
 
       return {
-        totalProcessed: indexedDocuments,
+        totalProcessed,
         totalDocuments,
         pendingIndexing,
         pendingCleanup,
-        isComplete: indexedDocuments === totalDocuments && pendingCleanup === 0,
+        isComplete: totalProcessed === totalDocuments && pendingCleanup === 0,
       };
     }
 
     /**
      * Synchronizes data between the MongoDB collection and the MeiliSearch index by
-     * incrementally indexing only non-temporary documents where `_meiliIndex` is not `true`.
+     * incrementally indexing only non-temporary documents that are unindexed or stale.
      * */
     static async syncWithMeili(this: SchemaWithMeiliMethods): Promise<void> {
       const startTime = Date.now();
@@ -453,6 +487,7 @@ const createMeiliMongooseModel = ({
       );
 
       // Get approximate total count for raw estimation, the sync should not overcome this number
+      // eslint-disable-next-line no-restricted-syntax -- a collection-wide estimate is the quantity wanted here: it bounds a full-index sync and only feeds a progress log, so a tenant-scoped count would be wrong, not just unnecessary.
       const approxTotalCount = await this.estimatedDocumentCount();
       logger.info(
         `[syncWithMeili] Approximate total number of all ${collectionName}: ${approxTotalCount}`,
@@ -474,8 +509,18 @@ const createMeiliMongooseModel = ({
       while (hasMore) {
         const indexableQuery = getIndexableQuery();
         const query: FilterQuery<unknown> = {
-          ...indexableQuery,
-          _meiliIndex: { $ne: true },
+          $and: [
+            indexableQuery,
+            {
+              $or: [
+                { _meiliIndex: { $ne: true } },
+                {
+                  _meiliIndex: true,
+                  _meiliIndexSchemaVersion: { $ne: MEILI_INDEX_SCHEMA_VERSION },
+                },
+              ],
+            },
+          ],
         };
 
         try {
@@ -548,7 +593,13 @@ const createMeiliMongooseModel = ({
         // original conversation/message timestamps (fixes sidebar chronological sort).
         await this.updateMany(
           { _id: { $in: docsIds } },
-          { $set: { _meiliIndex: true, _meiliCleanupVersion: meiliCleanupVersion } },
+          {
+            $set: {
+              _meiliIndex: true,
+              _meiliCleanupVersion: meiliCleanupVersion,
+              _meiliIndexSchemaVersion: MEILI_INDEX_SCHEMA_VERSION,
+            },
+          },
           { timestamps: false },
         );
       } catch (error) {
@@ -912,6 +963,11 @@ export default function mongoMeili(schema: Schema, options: MongoMeiliOptions): 
       required: false,
       select: false,
     },
+    _meiliIndexSchemaVersion: {
+      type: Number,
+      required: false,
+      select: false,
+    },
     _meiliCleanupVersion: {
       type: Number,
       required: false,
@@ -941,14 +997,21 @@ export default function mongoMeili(schema: Schema, options: MongoMeiliOptions): 
         },
       },
     );
+    /* Serves the legacy branch of `buildExcludedIndexedQuery`. MongoDB rewrites
+     * `$exists: false` into `$not`, which no `partialFilterExpression` accepts, so the
+     * unstamped state is expressed as a null equality: it admits an absent or null
+     * `_meiliCleanupVersion` and keeps every already-stamped document out, which is what
+     * bounds this index to the shrinking legacy population rather than to every
+     * excluded document ever written. Cleanup stamps the version, and the document
+     * leaves the index. */
     schema.index(
       { _meiliIndex: 1, _meiliCleanupVersion: 1, [options.primaryKey]: 1 },
       {
-        name: 'meili_excluded_legacy_cleanup_v3',
+        name: 'meili_excluded_legacy_cleanup_v4',
         partialFilterExpression: {
           [options.excludeFromIndexPath]: { $exists: true },
           _meiliIndex: { $eq: false },
-          _meiliCleanupVersion: { $exists: false },
+          _meiliCleanupVersion: { $eq: null },
         },
       },
     );

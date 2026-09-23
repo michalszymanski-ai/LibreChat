@@ -10,6 +10,7 @@ const {
   sanitizeFileForTransmit,
   extractFileContext,
   getReferencedQuotes,
+  applyTurnDelivery,
   encodeAndFormatAudios,
   encodeAndFormatVideos,
   getTransactionsConfig,
@@ -17,25 +18,36 @@ const {
   getLangfuseTraceMessageFields,
   isContentFilterError,
   assertModelBoundProviderContent,
+  reportLocatorTraversalFailure,
   collectModelBoundHistoricalFileIdState,
   projectModelBoundSourceFiles,
+  isModelBoundAttachmentFile,
+  isToolOwnedAttachment,
+  withBalanceReservations,
+  findCheckpointSummaryPart,
+  getSummaryPartText,
+  runAfterSeed,
+  saveTurnConversation,
+  seedTurnConversation,
+  needsRetentionConversation,
+  getConversationWriteContext,
 } = require('@librechat/api');
 const {
   Constants,
   FileSources,
   Tools,
+  ErrorTypes,
   ContentTypes,
-  excludedKeys,
+  isCompactedLeaf,
   EModelEndpoint,
-  mergeFileConfig,
   isParamEndpoint,
   isAgentsEndpoint,
-  isEphemeralAgentId,
   supportsBalanceCheck,
   isBedrockDocumentType,
   HITL_MESSAGE_FILTER_FIELDS,
-  getEndpointFileConfig,
   stripReasoningLabelMetadata,
+  resolveTurnLLMDeliveryPath,
+  resolveUseResponsesApi,
 } = require('librechat-data-provider');
 const { getStrategyFunctions } = require('~/server/services/Files/strategies');
 const { logViolation } = require('~/cache');
@@ -239,10 +251,6 @@ class BaseClient {
     this.currentMessages = [];
     /** @type {import('librechat-data-provider').VisionModes | undefined} */
     this.visionMode;
-    /** @type {import('librechat-data-provider').FileConfig | undefined} */
-    this._mergedFileConfig;
-    /** @type {import('librechat-data-provider').EndpointFileConfig | undefined} */
-    this._endpointFileConfig;
   }
 
   setOptions() {
@@ -286,6 +294,12 @@ class BaseClient {
     return false;
   }
 
+  /** Whether a deferred parent write may still create a new conversation's row up front, so
+   * the conversation lists can return it while the run is in flight. */
+  shouldSeedDeferredConversation() {
+    return false;
+  }
+
   /** Returns the request-scoped deferred parent-write controller, when any. */
   getModelBoundUserMessagePersistence() {
     return this.modelBoundUserMessagePersistence;
@@ -304,6 +318,7 @@ class BaseClient {
       : [{ role: 'user', content: payload, isCreatedByUser: true, isUserSubmitted: true }];
     const fileProjection = this.getModelBoundFileProjection();
     assertModelBoundProviderContent({
+      onTraversalFailure: reportLocatorTraversalFailure,
       filters: this.options.req?.config?.filters,
       legacyPii: this.options.req?.config?.messageFilter?.pii,
       providerMessages: messages,
@@ -445,6 +460,10 @@ class BaseClient {
 
     const [overrideConvoId, overrideUserMessageId] = this.processOverideIds();
     const { isEdited, isContinued } = opts;
+    if (opts.isCompaction === true) {
+      /** The leaf stands in for the user message and is already persisted. */
+      this.skipSaveUserMessage = true;
+    }
     const user = opts.user ?? null;
     this.user = user;
     const saveOptions = this.getSaveOptions();
@@ -498,7 +517,68 @@ class BaseClient {
       sender: 'User',
       text,
       isCreatedByUser: true,
+      ...(this.options?.req?._agentEventTriggerProjection != null && {
+        subagentTriggerProjection: this.options.req._agentEventTriggerProjection,
+      }),
     };
+  }
+
+  /**
+   * The message a compaction turn hangs off: the branch's leaf, presented in
+   * the user-message slot so the response parents onto it and every consumer
+   * of `userMessage` (progress, job metadata, the abort path) keeps working.
+   * Identity fields only: the row stays in history untouched, and the object
+   * mirrored into job metadata must not carry the leaf's full content.
+   * @param {string} parentMessageId
+   * @returns {TMessage}
+   */
+  getCompactionAnchor(parentMessageId) {
+    const leaf = this.currentMessages[this.currentMessages.length - 1];
+    if (leaf == null || leaf.messageId !== parentMessageId) {
+      throw Object.assign(new Error('The message to compact up to was not found.'), {
+        statusCode: 404,
+        code: 'COMPACTION_ANCHOR_NOT_FOUND',
+      });
+    }
+    if (isCompactedLeaf(leaf)) {
+      /** Typed so a stream that already started renders localized copy. */
+      throw Object.assign(
+        new Error(
+          JSON.stringify({
+            type: ErrorTypes.COMPACTION_SKIPPED,
+            reason: 'nothing_to_summarize',
+          }),
+        ),
+        { statusCode: 409, code: 'NOTHING_TO_COMPACT' },
+      );
+    }
+    return {
+      messageId: leaf.messageId,
+      parentMessageId: leaf.parentMessageId,
+      conversationId: leaf.conversationId,
+      isCreatedByUser: leaf.isCreatedByUser === true,
+      text: '',
+    };
+  }
+
+  /**
+   * The message the turn hangs off: a fresh user message, the edited message
+   * already in history, or (for a compaction) the branch's leaf.
+   * @returns {TMessage}
+   */
+  resolveStartUserMessage({ opts, message, userMessageId, parentMessageId, conversationId }) {
+    if (opts.isCompaction) {
+      return this.getCompactionAnchor(parentMessageId);
+    }
+    if (opts.isEdited) {
+      return this.currentMessages[this.currentMessages.length - 2];
+    }
+    return this.createUserMessage({
+      messageId: userMessageId,
+      parentMessageId,
+      conversationId,
+      text: message,
+    });
   }
 
   async handleStartMethods(message, opts) {
@@ -514,14 +594,13 @@ class BaseClient {
     } = await this.setMessageOptions(opts);
     this.options.startupTelemetry?.mark('history_loaded');
 
-    const userMessage = opts.isEdited
-      ? this.currentMessages[this.currentMessages.length - 2]
-      : this.createUserMessage({
-          messageId: userMessageId,
-          parentMessageId,
-          conversationId,
-          text: message,
-        });
+    const userMessage = this.resolveStartUserMessage({
+      opts,
+      message,
+      userMessageId,
+      parentMessageId,
+      conversationId,
+    });
 
     /**
      * Attach quoted excerpts (the "Add to chat" selections from `req.body.quotes`)
@@ -531,7 +610,7 @@ class BaseClient {
      * merged into the model-facing text later, per message, in `buildMessages`,
      * keeping the stored `text` clean while the count stays consistent.
      */
-    if (!opts.isEdited) {
+    if (!opts.isEdited && !opts.isCompaction) {
       const referencedQuotes = getReferencedQuotes(this.options.req?.body?.quotes);
       if (referencedQuotes != null) {
         userMessage.quotes = referencedQuotes;
@@ -667,538 +746,549 @@ class BaseClient {
     };
   }
 
+  /** Wraps the upstream turn in a `chat.send_message` span plus turn metrics, leaving its body untouched. */
   async sendMessage(message, opts = {}) {
     const startTime = Date.now();
+    const metricAttributes = () => ({
+      model: this.modelOptions?.model ?? this.model ?? 'unknown',
+      endpoint: this.options.endpoint ?? 'unknown',
+    });
     return tracer.startActiveSpan('chat.send_message', async (span) => {
+      span.setAttributes({
+        'chat.model': this.modelOptions?.model ?? this.model ?? 'unknown',
+        'chat.endpoint': this.options.endpoint ?? 'unknown',
+        'chat.conversation_id': opts.conversationId ?? 'new',
+        'chat.is_edited': !!opts.isEdited,
+      });
       try {
-        span.setAttributes({
-          'chat.model': this.modelOptions?.model ?? this.model ?? 'unknown',
-          'chat.endpoint': this.options.endpoint ?? 'unknown',
-          'chat.conversation_id': opts.conversationId ?? 'new',
-          'chat.is_edited': !!opts.isEdited,
-        });
-        const appConfig = this.options.req?.config;
-        /** @type {Promise<TMessage>} */
-        let userMessagePromise;
-        /** @type {{ promise: Promise<unknown>, isPending: () => boolean, start: () => Promise<unknown>, cancel: () => Promise<unknown> } | undefined} */
-        let userMessagePersistence;
-        this.modelBoundUserMessagePersistence = undefined;
-        const {
-          user,
-          head,
-          isEdited,
-          conversationId,
-          responseMessageId,
-          saveOptions,
-          userMessage,
-        } = await this.handleStartMethods(message, opts);
-
-        if (opts.progressCallback) {
-          opts.onProgress = opts.progressCallback.call(null, {
-            ...(opts.progressOptions ?? {}),
-            parentMessageId: userMessage.messageId,
-            messageId: responseMessageId,
-          });
-        }
-
-        const { editedContent } = opts;
-
-        // It's not necessary to push to currentMessages
-        // depending on subclass implementation of handling messages
-        // When this is an edit, all messages are already in currentMessages, both user and response
-        if (isEdited) {
-          let latestMessage = this.currentMessages[this.currentMessages.length - 1];
-          if (!latestMessage) {
-            latestMessage = {
-              messageId: responseMessageId,
-              conversationId,
-              parentMessageId: userMessage.messageId,
-              isCreatedByUser: false,
-              model: this.modelOptions?.model ?? this.model,
-              sender: this.sender,
-            };
-            this.currentMessages.push(userMessage, latestMessage);
-          } else if (editedContent != null) {
-            // Handle editedContent for content parts
-            if (editedContent && latestMessage.content && Array.isArray(latestMessage.content)) {
-              const { index, type } = editedContent;
-              const text = editedContent[type];
-              if (index >= 0 && index < latestMessage.content.length) {
-                const contentPart = latestMessage.content[index];
-                let didApplyEdit = false;
-                if (type === ContentTypes.THINK && contentPart.type === ContentTypes.THINK) {
-                  contentPart[ContentTypes.THINK] = text;
-                  didApplyEdit = true;
-                  delete contentPart.reasoning_label;
-                  delete contentPart.reasoning_label_step_id;
-                  delete contentPart.reasoning_label_attempts;
-                  delete contentPart.reasoning_label_submitted_chars;
-                  delete contentPart.reasoning_label_revision;
-                  delete contentPart.reasoning_label_status;
-                } else if (type === ContentTypes.TEXT && contentPart.type === ContentTypes.TEXT) {
-                  contentPart[ContentTypes.TEXT] = text;
-                  didApplyEdit = true;
-                }
-                if (didApplyEdit) {
-                  latestMessage.userSubmittedPaths = mergeUserSubmittedPaths(
-                    latestMessage.userSubmittedPaths,
-                    [`/content/${index}/${type}`],
-                  );
-                }
-              }
-            }
-          }
-          this.continued = true;
-        } else {
-          this.currentMessages.push(userMessage);
-        }
-
-        /**
-         * When the userMessage is pushed to currentMessages, the parentMessage is the userMessageId.
-         * this only matters when buildMessages is utilizing the parentMessageId, and may vary on implementation
-         */
-        const parentMessageId = isEdited ? head : userMessage.messageId;
-        this.parentMessageId = parentMessageId;
-        const modelBoundStoredMessages = this.getModelBoundStoredMessages(this.currentMessages);
-        this.setModelBoundStoredMessages(modelBoundStoredMessages);
-        this.assertStoredModelBoundContent();
-        this.modelBoundCurrentFiles = Array.isArray(this.options.attachments)
-          ? [...this.options.attachments]
-          : [];
-        if (this.options.resendFiles !== false && this.authorizedHistoricalFiles == null) {
-          const historicalFileState =
-            collectModelBoundHistoricalFileIdState(modelBoundStoredMessages);
-          this.modelBoundHistoricalFileIdsOverflowed ||= historicalFileState.overflowed;
-          const files = await getOwnerHistoricalFiles(
-            historicalFileState.fileIds,
-            this.options.req?.user,
-          );
-          this.authorizedHistoricalFiles = new Map(
-            files
-              .filter((file) => typeof file?.file_id === 'string' && file.file_id.length > 0)
-              .map((file) => [file.file_id, file]),
-          );
-        }
-        let {
-          prompt: payload,
-          tokenCountMap,
-          promptTokens,
-        } = await this.buildMessages(
-          modelBoundStoredMessages,
-          parentMessageId,
-          this.getBuildMessagesOptions(opts),
-          opts,
-        );
-        this.assertBuiltModelBoundContent(payload);
-        this.options.startupTelemetry?.mark('messages_built');
-
-        if (tokenCountMap && tokenCountMap[userMessage.messageId]) {
-          userMessage.tokenCount = tokenCountMap[userMessage.messageId];
-          logger.debug('[BaseClient] userMessage', {
-            messageId: userMessage.messageId,
-            tokenCount: userMessage.tokenCount,
-            conversationId: userMessage.conversationId,
-          });
-        }
-
-        if (!isEdited && !this.skipSaveUserMessage) {
-          const reqFiles = this.options.req?.body?.files;
-          if (reqFiles && Array.isArray(this.options.attachments)) {
-            const files = buildMessageFiles(reqFiles, this.options.attachments);
-            if (files.length > 0) {
-              userMessage.files = files;
-            }
-            delete userMessage.image_urls;
-          }
-          /**
-           * Persist the user's manual skill picks onto the user message so the
-           * frontend `SkillPills` component can render them in history
-           * after reload. UI-only metadata — the runtime skill resolution
-           * pipeline reads the top-level `req.body.manualSkills` separately.
-           * Filter is defense-in-depth on top of Mongoose schema validation:
-           * keeps the DB row free of empty/non-string entries even if a
-           * crafted payload slips past schema checks upstream.
-           */
-          const rawManualSkills = this.options.req?.body?.manualSkills;
-          if (Array.isArray(rawManualSkills) && rawManualSkills.length > 0) {
-            const skills = rawManualSkills.filter((s) => typeof s === 'string' && s.length > 0);
-            if (skills.length > 0) {
-              userMessage.manualSkills = skills;
-            }
-          }
-          /**
-           * Persist the names of skills auto-primed this turn via `always-apply`
-           * frontmatter so `SkillPills` can render pinned-variant badges
-           * on the user bubble that survive reload and history render. Frozen
-           * at turn time (not reconstructed from `Skill.alwaysApply` at render
-           * time) because the flag is mutable — historical turns must keep
-           * their audit trail even if an admin flips `alwaysApply` off later.
-           */
-          const alwaysApplySkillPrimes = this.options.agent?.alwaysApplySkillPrimes;
-          if (Array.isArray(alwaysApplySkillPrimes) && alwaysApplySkillPrimes.length > 0) {
-            const names = alwaysApplySkillPrimes
-              .map((p) => p?.name)
-              .filter((n) => typeof n === 'string' && n.length > 0);
-            if (names.length > 0) {
-              userMessage.alwaysAppliedSkills = names;
-            }
-          }
-          const startUserMessagePersistence = () => {
-            this.savedMessageIds.add(userMessage.messageId);
-            return this.saveMessageToDatabase(userMessage, saveOptions, user).catch((err) => {
-              logger.error('[BaseClient] Failed to save user message:', err);
-              return {};
-            });
-          };
-          if (this.shouldDeferUserMessagePersistence()) {
-            let state = 'pending';
-            let startPersistence = startUserMessagePersistence;
-            let resolvePersistence;
-            let removeAbortListener = () => {};
-            const persistencePromise = new Promise((resolve) => {
-              resolvePersistence = resolve;
-            });
-            const start = () => {
-              if (state !== 'pending') {
-                return persistencePromise;
-              }
-              state = 'started';
-              removeAbortListener();
-              const startDeferredPersistence = startPersistence;
-              startPersistence = undefined;
-              try {
-                Promise.resolve(startDeferredPersistence?.()).then(resolvePersistence, () =>
-                  resolvePersistence({}),
-                );
-              } catch (error) {
-                logger.error(
-                  '[BaseClient] Failed to start deferred user-message persistence:',
-                  error,
-                );
-                resolvePersistence({});
-              }
-              return persistencePromise;
-            };
-            const cancel = () => {
-              if (state !== 'pending') {
-                return persistencePromise;
-              }
-              state = 'cancelled';
-              removeAbortListener();
-              startPersistence = undefined;
-              /** Resolve with a non-persisted sentinel. The subagent task store
-               * validates the result and fails child creation closed, while the
-               * request's policy error remains the only surfaced rejection. */
-              resolvePersistence({});
-              return persistencePromise;
-            };
-            userMessagePersistence = Object.freeze({
-              promise: persistencePromise,
-              isPending: () => state === 'pending',
-              start,
-              cancel,
-            });
-            const requestAbortSignal = this.abortController?.signal;
-            if (requestAbortSignal?.aborted) {
-              /** Preserve the historical durability contract for Stop: abort
-               * persistence may publish the partial assistant response before the
-               * provider unwinds, so its parent write must already be underway. */
-              start();
-            } else if (requestAbortSignal != null) {
-              const startOnAbort = () => start();
-              requestAbortSignal.addEventListener('abort', startOnAbort, { once: true });
-              removeAbortListener = () =>
-                requestAbortSignal.removeEventListener('abort', startOnAbort);
-            }
-            this.modelBoundUserMessagePersistence = userMessagePersistence;
-            userMessagePromise = persistencePromise;
-          } else {
-            userMessagePromise = startUserMessagePersistence();
-          }
-          if (typeof opts?.getReqData === 'function') {
-            opts.getReqData({
-              userMessagePromise,
-            });
-          }
-        }
-
-        const balanceConfig = getBalanceConfig(appConfig);
-        const transactionsConfig = getTransactionsConfig(appConfig);
-        let completionResult;
-        try {
-          if (
-            balanceConfig?.enabled &&
-            supportsBalanceCheck[this.options.endpointType ?? this.options.endpoint]
-          ) {
-            await checkBalance(
-              {
-                req: this.options.req,
-                res: this.options.res,
-                txData: {
-                  user: this.user,
-                  tokenType: 'prompt',
-                  amount: promptTokens,
-                  endpoint: this.options.endpoint,
-                  model: this.modelOptions?.model ?? this.model,
-                  endpointTokenConfig: this.options.endpointTokenConfig,
-                },
-              },
-              {
-                logViolation,
-                getMultiplier: db.getMultiplier,
-                findBalanceByUser: db.findBalanceByUser,
-                createAutoRefillTransaction: db.createAutoRefillTransaction,
-                balanceConfig,
-                upsertBalanceFields: db.upsertBalanceFields,
-              },
-            );
-          }
-
-          completionResult = await this.sendCompletion(payload, opts);
-        } catch (error) {
-          if (userMessagePersistence?.isPending()) {
-            if (isContentFilterError(error)) {
-              userMessagePersistence.cancel();
-            } else {
-              userMessagePersistence.start();
-            }
-          }
-          throw error;
-        }
-        /** A safe no-model completion (or a runtime that cannot expose the
-         * admission callback) must not leave the parent-write gate pending. */
-        userMessagePersistence?.start();
-        const { completion, metadata } = completionResult;
-        if (this.abortController) {
-          this.abortController.requestCompleted = true;
-        }
-
-        const isAgentResponse =
-          this.clientName === EModelEndpoint.agents || isAgentsEndpoint(this.options.endpoint);
-        const langfuseTraceFields = isAgentResponse
-          ? await getLangfuseTraceMessageFields(appConfig, responseMessageId)
-          : undefined;
-
-        /** @type {TMessage} */
-        const responseMessage = {
-          messageId: responseMessageId,
-          conversationId,
-          parentMessageId: userMessage.messageId,
-          isCreatedByUser: false,
-          ...(langfuseTraceFields ?? {}),
-          isEdited,
-          model: this.getResponseModel(),
-          sender: this.sender,
-          promptTokens,
-          iconURL: this.options.iconURL,
-          endpoint: this.options.endpoint,
-          ...(this.metadata ?? {}),
-          metadata: Object.keys(metadata ?? {}).length > 0 ? metadata : undefined,
-        };
-        let editedSourceMessage;
-        let editedSourceContentLength = 0;
-
-        if (typeof completion === 'string') {
-          responseMessage.text = completion;
-        } else if (
-          Array.isArray(completion) &&
-          (this.clientName === EModelEndpoint.agents ||
-            isParamEndpoint(this.options.endpoint, this.options.endpointType))
-        ) {
-          responseMessage.text = '';
-
-          if (!opts.editedContent || this.currentMessages.length === 0) {
-            responseMessage.content = completion;
-          } else {
-            const latestMessage = this.currentMessages[this.currentMessages.length - 1];
-            if (!latestMessage?.content) {
-              responseMessage.content = completion;
-            } else {
-              editedSourceMessage = latestMessage;
-              editedSourceContentLength = latestMessage.content.length;
-              const existingContent = [...latestMessage.content];
-              const { type: editedType } = opts.editedContent;
-              responseMessage.content = this.mergeEditedContent(
-                existingContent,
-                completion,
-                editedType,
-              );
-            }
-          }
-        } else if (Array.isArray(completion)) {
-          responseMessage.text = completion.join('');
-        }
-
-        if (Array.isArray(responseMessage.content)) {
-          const userSubmittedPaths = [];
-          const userSubmittedMessageFieldPaths = [];
-          for (let index = 0; index < responseMessage.content.length; index++) {
-            if (responseMessage.content[index]?.type === ContentTypes.STEER) {
-              userSubmittedPaths.push(`/content/${index}`);
-            }
-          }
-          if (editedSourceMessage != null) {
-            userSubmittedPaths.push(
-              ...(editedSourceMessage.userSubmittedPaths ?? []).filter((path) => {
-                const match = /^\/content\/(\d+)(?:\/|$)/.exec(path);
-                return match != null && Number(match[1]) < editedSourceContentLength;
-              }),
-            );
-            userSubmittedMessageFieldPaths.push(
-              ...(editedSourceMessage.userSubmittedMessageFieldPaths ?? []).filter((entry) => {
-                const match = /^\/content\/(\d+)(?:\/|$)/.exec(entry?.path);
-                return match != null && Number(match[1]) < editedSourceContentLength;
-              }),
-            );
-            if (editedSourceMessage.isUserSubmitted === true) {
-              for (let index = 0; index < editedSourceContentLength; index++) {
-                userSubmittedPaths.push(`/content/${index}`);
-              }
-            }
-            const editedIndex = opts.editedContent?.index;
-            const editedType = opts.editedContent?.type;
-            if (
-              Number.isInteger(editedIndex) &&
-              editedIndex >= 0 &&
-              editedIndex < editedSourceContentLength &&
-              (editedType === ContentTypes.TEXT || editedType === ContentTypes.THINK)
-            ) {
-              userSubmittedPaths.push(`/content/${editedIndex}/${editedType}`);
-            }
-          }
-          if (userSubmittedPaths.length > 0) {
-            responseMessage.userSubmittedPaths = mergeUserSubmittedPaths(userSubmittedPaths);
-          }
-          if (userSubmittedMessageFieldPaths.length > 0) {
-            responseMessage.userSubmittedMessageFieldPaths = mergeUserSubmittedMessageFieldPaths(
-              userSubmittedMessageFieldPaths,
-            );
-          }
-        }
-
-        if (tokenCountMap && this.recordTokenUsage && this.getTokenCountForResponse) {
-          let completionTokens;
-
-          /**
-           * Metadata about input/output costs for the current message. The client
-           * should provide a function to get the current stream usage metadata; if not,
-           * use the legacy token estimations.
-           * @type {StreamUsage | null} */
-          const usage = this.getStreamUsage != null ? this.getStreamUsage() : null;
-
-          if (usage != null && Number(usage[this.outputTokensKey]) > 0) {
-            responseMessage.tokenCount = usage[this.outputTokensKey];
-            completionTokens = responseMessage.tokenCount;
-          } else {
-            responseMessage.tokenCount = this.getTokenCountForResponse(responseMessage);
-            completionTokens = responseMessage.tokenCount;
-            await this.recordTokenUsage({
-              usage,
-              promptTokens,
-              completionTokens,
-              balance: balanceConfig,
-              transactions: transactionsConfig,
-              /** Note: When using agents, responseMessage.model is the agent ID, not the model */
-              model: this.model,
-              messageId: this.responseMessageId,
-            });
-          }
-
-          logger.debug('[BaseClient] Response token usage', {
-            messageId: responseMessage.messageId,
-            model: responseMessage.model,
-            promptTokens,
-            completionTokens,
-          });
-        }
-
-        if (userMessagePromise) {
-          await userMessagePromise;
-        }
-
-        if (
-          this.contextMeta?.calibrationRatio > 0 &&
-          this.contextMeta.calibrationRatio !== 1 &&
-          userMessage.tokenCount > 0
-        ) {
-          const calibrated = Math.round(userMessage.tokenCount * this.contextMeta.calibrationRatio);
-          if (calibrated !== userMessage.tokenCount) {
-            logger.debug('[BaseClient] Calibrated user message tokenCount', {
-              messageId: userMessage.messageId,
-              raw: userMessage.tokenCount,
-              calibrated,
-              ratio: this.contextMeta.calibrationRatio,
-            });
-            userMessage.tokenCount = calibrated;
-            await this.updateMessageInDatabase({
-              messageId: userMessage.messageId,
-              tokenCount: calibrated,
-            });
-          }
-        }
-
-        if (this.artifactPromises) {
-          responseMessage.attachments = (await Promise.all(this.artifactPromises)).filter((a) => a);
-        }
-
-        if (this.options.attachments) {
-          try {
-            saveOptions.files = this.options.attachments.map((attachments) => attachments.file_id);
-          } catch (error) {
-            logger.error('[BaseClient] Error mapping attachments for conversation', error);
-          }
-        }
-
-        if (this.contextMeta) {
-          responseMessage.contextMeta = this.contextMeta;
-        }
-
-        /** Resumable generation controllers must win the generation's terminal
-         * CAS before this outcome-defining `unfinished:false` write can begin.
-         * The hook is deliberately narrow: ordinary clients omit it, and `false`
-         * means another terminal owner (for example Stop) already won, so this
-         * stale completion must return without writing the response row. */
-        if (typeof opts.beforeResponsePersistence === 'function') {
-          const ownsTerminalPersistence = await opts.beforeResponsePersistence(responseMessage);
-          if (ownsTerminalPersistence === false) {
-            responseMessage.databasePromise = Promise.resolve({ persistenceSkipped: true });
-            span.end();
-            return responseMessage;
-          }
-        }
-
-        responseMessage.databasePromise = this.saveMessageToDatabase(
-          responseMessage,
-          saveOptions,
-          user,
-        );
-        this.savedMessageIds.add(responseMessage.messageId);
-        chatTurnCounter.add(1, {
-          model: this.modelOptions?.model ?? this.model ?? 'unknown',
-          endpoint: this.options.endpoint ?? 'unknown',
-        });
-        chatTurnDuration.record(Date.now() - startTime, {
-          model: this.modelOptions?.model ?? this.model ?? 'unknown',
-          endpoint: this.options.endpoint ?? 'unknown',
-        });
-        span.end();
+        const responseMessage = await this.sendMessageUntraced(message, opts);
+        chatTurnCounter.add(1, metricAttributes());
+        chatTurnDuration.record(Date.now() - startTime, metricAttributes());
         return responseMessage;
       } catch (err) {
         span.recordException(err);
         span.setStatus({ code: SpanStatusCode.ERROR });
-        chatTurnCounter.add(1, {
-          model: this.modelOptions?.model ?? this.model ?? 'unknown',
-          endpoint: this.options.endpoint ?? 'unknown',
-          error: true,
-        });
-        chatTurnDuration.record(Date.now() - startTime, {
-          model: this.modelOptions?.model ?? this.model ?? 'unknown',
-          endpoint: this.options.endpoint ?? 'unknown',
-        });
-        span.end();
+        chatTurnCounter.add(1, { ...metricAttributes(), error: true });
+        chatTurnDuration.record(Date.now() - startTime, metricAttributes());
         throw err;
+      } finally {
+        span.end();
       }
     });
+  }
+
+  async sendMessageUntraced(message, opts = {}) {
+    return withBalanceReservations((balanceReservations) =>
+      this.sendReservedMessage(message, opts, balanceReservations),
+    );
+  }
+
+  /**
+   * @param {string} message
+   * @param {Record<string, unknown>} opts
+   * @param {BalanceReservations} balanceReservations - Holds the balance reservation admitting
+   * this message; released once its usage is recorded, and by `sendMessage` on any other exit.
+   */
+  async sendReservedMessage(message, opts, balanceReservations) {
+    const appConfig = this.options.req?.config;
+    /** @type {Promise<TMessage>} */
+    let userMessagePromise;
+    /** @type {{ promise: Promise<unknown>, isPending: () => boolean, start: () => Promise<unknown>, cancel: () => Promise<unknown> } | undefined} */
+    let userMessagePersistence;
+    this.modelBoundUserMessagePersistence = undefined;
+    const { user, head, isEdited, conversationId, responseMessageId, saveOptions, userMessage } =
+      await this.handleStartMethods(message, opts);
+
+    if (opts.progressCallback) {
+      opts.onProgress = opts.progressCallback.call(null, {
+        ...(opts.progressOptions ?? {}),
+        parentMessageId: userMessage.messageId,
+        messageId: responseMessageId,
+      });
+    }
+
+    const { editedContent } = opts;
+
+    // It's not necessary to push to currentMessages
+    // depending on subclass implementation of handling messages
+    // When this is an edit, all messages are already in currentMessages, both user and response
+    if (isEdited) {
+      let latestMessage = this.currentMessages[this.currentMessages.length - 1];
+      if (!latestMessage) {
+        latestMessage = {
+          messageId: responseMessageId,
+          conversationId,
+          parentMessageId: userMessage.messageId,
+          isCreatedByUser: false,
+          model: this.modelOptions?.model ?? this.model,
+          sender: this.sender,
+        };
+        this.currentMessages.push(userMessage, latestMessage);
+      } else if (editedContent != null) {
+        // Handle editedContent for content parts
+        if (editedContent && latestMessage.content && Array.isArray(latestMessage.content)) {
+          const { index, type } = editedContent;
+          const text = editedContent[type];
+          if (index >= 0 && index < latestMessage.content.length) {
+            const contentPart = latestMessage.content[index];
+            let didApplyEdit = false;
+            if (type === ContentTypes.THINK && contentPart.type === ContentTypes.THINK) {
+              contentPart[ContentTypes.THINK] = text;
+              didApplyEdit = true;
+              delete contentPart.reasoning_label;
+              delete contentPart.reasoning_label_step_id;
+              delete contentPart.reasoning_label_attempts;
+              delete contentPart.reasoning_label_submitted_chars;
+              delete contentPart.reasoning_label_revision;
+              delete contentPart.reasoning_label_status;
+            } else if (type === ContentTypes.TEXT && contentPart.type === ContentTypes.TEXT) {
+              contentPart[ContentTypes.TEXT] = text;
+              didApplyEdit = true;
+            }
+            if (didApplyEdit) {
+              latestMessage.userSubmittedPaths = mergeUserSubmittedPaths(
+                latestMessage.userSubmittedPaths,
+                [`/content/${index}/${type}`],
+              );
+            }
+          }
+        }
+      }
+      this.continued = true;
+    } else if (opts.isCompaction !== true) {
+      this.currentMessages.push(userMessage);
+    }
+
+    /**
+     * When the userMessage is pushed to currentMessages, the parentMessage is the userMessageId.
+     * this only matters when buildMessages is utilizing the parentMessageId, and may vary on implementation
+     */
+    const parentMessageId = isEdited ? head : userMessage.messageId;
+    this.parentMessageId = parentMessageId;
+    const modelBoundStoredMessages = this.getModelBoundStoredMessages(this.currentMessages);
+    this.setModelBoundStoredMessages(modelBoundStoredMessages);
+    this.assertStoredModelBoundContent();
+    this.modelBoundCurrentFiles = Array.isArray(this.options.attachments)
+      ? [...this.options.attachments]
+      : [];
+    if (this.options.resendFiles !== false && this.authorizedHistoricalFiles == null) {
+      const historicalFileState = collectModelBoundHistoricalFileIdState(modelBoundStoredMessages);
+      this.modelBoundHistoricalFileIdsOverflowed ||= historicalFileState.overflowed;
+      const files = this.resolveTurnAttachments(
+        await getOwnerHistoricalFiles(historicalFileState.fileIds, this.options.req?.user),
+      );
+      this.authorizedHistoricalFiles = new Map(
+        files
+          .filter((file) => typeof file?.file_id === 'string' && file.file_id.length > 0)
+          .map((file) => [file.file_id, file]),
+      );
+    }
+    let {
+      prompt: payload,
+      tokenCountMap,
+      promptTokens,
+    } = await this.buildMessages(
+      modelBoundStoredMessages,
+      parentMessageId,
+      this.getBuildMessagesOptions(opts),
+      opts,
+    );
+    this.assertBuiltModelBoundContent(payload);
+    this.options.startupTelemetry?.mark('messages_built');
+
+    /** A compaction anchor is the persisted leaf, whose own count must stay. */
+    if (tokenCountMap && tokenCountMap[userMessage.messageId] && opts.isCompaction !== true) {
+      userMessage.tokenCount = tokenCountMap[userMessage.messageId];
+      logger.debug('[BaseClient] userMessage', {
+        messageId: userMessage.messageId,
+        tokenCount: userMessage.tokenCount,
+        conversationId: userMessage.conversationId,
+      });
+    }
+
+    if (!isEdited && !this.skipSaveUserMessage) {
+      const reqFiles = this.options.req?.body?.files;
+      if (reqFiles && Array.isArray(this.options.attachments)) {
+        const files = buildMessageFiles(reqFiles, this.options.attachments);
+        if (files.length > 0) {
+          userMessage.files = files;
+        }
+        delete userMessage.image_urls;
+      }
+      /**
+       * Persist the user's manual skill picks onto the user message so the
+       * frontend `SkillPills` component can render them in history
+       * after reload. UI-only metadata — the runtime skill resolution
+       * pipeline reads the top-level `req.body.manualSkills` separately.
+       * Filter is defense-in-depth on top of Mongoose schema validation:
+       * keeps the DB row free of empty/non-string entries even if a
+       * crafted payload slips past schema checks upstream.
+       */
+      const rawManualSkills = this.options.req?.body?.manualSkills;
+      if (Array.isArray(rawManualSkills) && rawManualSkills.length > 0) {
+        const skills = rawManualSkills.filter((s) => typeof s === 'string' && s.length > 0);
+        if (skills.length > 0) {
+          userMessage.manualSkills = skills;
+        }
+      }
+      /**
+       * Persist the names of skills auto-primed this turn via `always-apply`
+       * frontmatter so `SkillPills` can render pinned-variant badges
+       * on the user bubble that survive reload and history render. Frozen
+       * at turn time (not reconstructed from `Skill.alwaysApply` at render
+       * time) because the flag is mutable — historical turns must keep
+       * their audit trail even if an admin flips `alwaysApply` off later.
+       */
+      const alwaysApplySkillPrimes = this.options.agent?.alwaysApplySkillPrimes;
+      if (Array.isArray(alwaysApplySkillPrimes) && alwaysApplySkillPrimes.length > 0) {
+        const names = alwaysApplySkillPrimes
+          .map((p) => p?.name)
+          .filter((n) => typeof n === 'string' && n.length > 0);
+        if (names.length > 0) {
+          userMessage.alwaysAppliedSkills = names;
+        }
+      }
+      const startUserMessagePersistence = () => {
+        this.savedMessageIds.add(userMessage.messageId);
+        return this.saveMessageToDatabase(userMessage, saveOptions, user).catch((err) => {
+          logger.error('[BaseClient] Failed to save user message:', err);
+          return {};
+        });
+      };
+      if (this.shouldDeferUserMessagePersistence()) {
+        let state = 'pending';
+        let startPersistence = startUserMessagePersistence;
+        if (!this.skipSaveConvo && this.shouldSeedDeferredConversation()) {
+          const seed = seedTurnConversation(
+            db,
+            this.getTurnConversationFields(
+              this.options,
+              userMessage.conversationId,
+              saveOptions,
+              'api/app/clients/BaseClient.js - sendMessage #seedConversation',
+            ),
+          );
+          startPersistence = runAfterSeed(seed, startUserMessagePersistence);
+        }
+        let resolvePersistence;
+        let removeAbortListener = () => {};
+        const persistencePromise = new Promise((resolve) => {
+          resolvePersistence = resolve;
+        });
+        const start = () => {
+          if (state !== 'pending') {
+            return persistencePromise;
+          }
+          state = 'started';
+          removeAbortListener();
+          const startDeferredPersistence = startPersistence;
+          startPersistence = undefined;
+          try {
+            Promise.resolve(startDeferredPersistence?.()).then(resolvePersistence, () =>
+              resolvePersistence({}),
+            );
+          } catch (error) {
+            logger.error('[BaseClient] Failed to start deferred user-message persistence:', error);
+            resolvePersistence({});
+          }
+          return persistencePromise;
+        };
+        const cancel = () => {
+          if (state !== 'pending') {
+            return persistencePromise;
+          }
+          state = 'cancelled';
+          removeAbortListener();
+          startPersistence = undefined;
+          /** Resolve with a non-persisted sentinel. The subagent task store
+           * validates the result and fails child creation closed, while the
+           * request's policy error remains the only surfaced rejection. */
+          resolvePersistence({});
+          return persistencePromise;
+        };
+        userMessagePersistence = Object.freeze({
+          promise: persistencePromise,
+          isPending: () => state === 'pending',
+          start,
+          cancel,
+        });
+        const requestAbortSignal = this.abortController?.signal;
+        if (requestAbortSignal?.aborted) {
+          /** Preserve the historical durability contract for Stop: abort
+           * persistence may publish the partial assistant response before the
+           * provider unwinds, so its parent write must already be underway. */
+          start();
+        } else if (requestAbortSignal != null) {
+          const startOnAbort = () => start();
+          requestAbortSignal.addEventListener('abort', startOnAbort, { once: true });
+          removeAbortListener = () => requestAbortSignal.removeEventListener('abort', startOnAbort);
+        }
+        this.modelBoundUserMessagePersistence = userMessagePersistence;
+        userMessagePromise = persistencePromise;
+      } else {
+        userMessagePromise = startUserMessagePersistence();
+      }
+      if (typeof opts?.getReqData === 'function') {
+        opts.getReqData({
+          userMessagePromise,
+        });
+      }
+    }
+
+    const balanceConfig = getBalanceConfig(appConfig);
+    const transactionsConfig = getTransactionsConfig(appConfig);
+    let completionResult;
+    try {
+      if (
+        balanceConfig?.enabled &&
+        supportsBalanceCheck[this.options.endpointType ?? this.options.endpoint]
+      ) {
+        const balanceAdmission = checkBalance(
+          {
+            req: this.options.req,
+            res: this.options.res,
+            txData: {
+              user: this.user,
+              tokenType: 'prompt',
+              amount: promptTokens,
+              endpoint: this.options.endpoint,
+              model: this.modelOptions?.model ?? this.model,
+              endpointTokenConfig: this.options.endpointTokenConfig,
+            },
+          },
+          {
+            logViolation,
+            getMultiplier: db.getMultiplier,
+            reserveBalance: db.reserveBalance,
+            renewBalanceReservation: db.renewBalanceReservation,
+            releaseBalanceReservation: db.releaseBalanceReservation,
+            balanceConfig,
+          },
+        );
+        await balanceReservations.track(balanceAdmission);
+      }
+
+      completionResult = await this.sendCompletion(payload, opts);
+    } catch (error) {
+      if (userMessagePersistence?.isPending()) {
+        if (isContentFilterError(error)) {
+          userMessagePersistence.cancel();
+        } else {
+          userMessagePersistence.start();
+        }
+      }
+      throw error;
+    }
+    /** A safe no-model completion (or a runtime that cannot expose the
+     * admission callback) must not leave the parent-write gate pending. */
+    userMessagePersistence?.start();
+    const { completion, metadata } = completionResult;
+    if (this.abortController) {
+      this.abortController.requestCompleted = true;
+    }
+
+    const isAgentResponse =
+      this.clientName === EModelEndpoint.agents || isAgentsEndpoint(this.options.endpoint);
+    const langfuseTraceFields = isAgentResponse
+      ? await getLangfuseTraceMessageFields(appConfig, responseMessageId)
+      : undefined;
+
+    /** @type {TMessage} */
+    const responseMessage = {
+      messageId: responseMessageId,
+      conversationId,
+      parentMessageId: userMessage.messageId,
+      isCreatedByUser: false,
+      ...(langfuseTraceFields ?? {}),
+      isEdited,
+      model: this.getResponseModel(),
+      sender: this.sender,
+      promptTokens,
+      iconURL: this.options.iconURL,
+      endpoint: this.options.endpoint,
+      ...(this.metadata ?? {}),
+      metadata: Object.keys(metadata ?? {}).length > 0 ? metadata : undefined,
+    };
+    let editedSourceMessage;
+    let editedSourceContentLength = 0;
+
+    if (typeof completion === 'string') {
+      responseMessage.text = completion;
+    } else if (
+      Array.isArray(completion) &&
+      (this.clientName === EModelEndpoint.agents ||
+        isParamEndpoint(this.options.endpoint, this.options.endpointType))
+    ) {
+      responseMessage.text = '';
+
+      if (!opts.editedContent || this.currentMessages.length === 0) {
+        responseMessage.content = completion;
+      } else {
+        const latestMessage = this.currentMessages[this.currentMessages.length - 1];
+        if (!latestMessage?.content) {
+          responseMessage.content = completion;
+        } else {
+          editedSourceMessage = latestMessage;
+          editedSourceContentLength = latestMessage.content.length;
+          const existingContent = [...latestMessage.content];
+          const { type: editedType } = opts.editedContent;
+          responseMessage.content = this.mergeEditedContent(
+            existingContent,
+            completion,
+            editedType,
+          );
+        }
+      }
+    } else if (Array.isArray(completion)) {
+      responseMessage.text = completion.join('');
+    }
+
+    if (Array.isArray(responseMessage.content)) {
+      const userSubmittedPaths = [];
+      const userSubmittedMessageFieldPaths = [];
+      for (let index = 0; index < responseMessage.content.length; index++) {
+        if (responseMessage.content[index]?.type === ContentTypes.STEER) {
+          userSubmittedPaths.push(`/content/${index}`);
+        }
+      }
+      if (editedSourceMessage != null) {
+        userSubmittedPaths.push(
+          ...(editedSourceMessage.userSubmittedPaths ?? []).filter((path) => {
+            const match = /^\/content\/(\d+)(?:\/|$)/.exec(path);
+            return match != null && Number(match[1]) < editedSourceContentLength;
+          }),
+        );
+        userSubmittedMessageFieldPaths.push(
+          ...(editedSourceMessage.userSubmittedMessageFieldPaths ?? []).filter((entry) => {
+            const match = /^\/content\/(\d+)(?:\/|$)/.exec(entry?.path);
+            return match != null && Number(match[1]) < editedSourceContentLength;
+          }),
+        );
+        if (editedSourceMessage.isUserSubmitted === true) {
+          for (let index = 0; index < editedSourceContentLength; index++) {
+            userSubmittedPaths.push(`/content/${index}`);
+          }
+        }
+        const editedIndex = opts.editedContent?.index;
+        const editedType = opts.editedContent?.type;
+        if (
+          Number.isInteger(editedIndex) &&
+          editedIndex >= 0 &&
+          editedIndex < editedSourceContentLength &&
+          (editedType === ContentTypes.TEXT || editedType === ContentTypes.THINK)
+        ) {
+          userSubmittedPaths.push(`/content/${editedIndex}/${editedType}`);
+        }
+      }
+      if (userSubmittedPaths.length > 0) {
+        responseMessage.userSubmittedPaths = mergeUserSubmittedPaths(userSubmittedPaths);
+      }
+      if (userSubmittedMessageFieldPaths.length > 0) {
+        responseMessage.userSubmittedMessageFieldPaths = mergeUserSubmittedMessageFieldPaths(
+          userSubmittedMessageFieldPaths,
+        );
+      }
+    }
+
+    if (tokenCountMap && this.recordTokenUsage && this.getTokenCountForResponse) {
+      let completionTokens;
+
+      /**
+       * Metadata about input/output costs for the current message. The client
+       * should provide a function to get the current stream usage metadata; if not,
+       * use the legacy token estimations.
+       * @type {StreamUsage | null} */
+      const usage = this.getStreamUsage != null ? this.getStreamUsage() : null;
+
+      if (usage != null && Number(usage[this.outputTokensKey]) > 0) {
+        responseMessage.tokenCount = usage[this.outputTokensKey];
+        completionTokens = responseMessage.tokenCount;
+      } else {
+        responseMessage.tokenCount = this.getTokenCountForResponse(responseMessage);
+        completionTokens = responseMessage.tokenCount;
+        await this.recordTokenUsage({
+          usage,
+          promptTokens,
+          completionTokens,
+          balance: balanceConfig,
+          transactions: transactionsConfig,
+          /** Note: When using agents, responseMessage.model is the agent ID, not the model */
+          model: this.model,
+          messageId: this.responseMessageId,
+        });
+      }
+
+      logger.debug('[BaseClient] Response token usage', {
+        messageId: responseMessage.messageId,
+        model: responseMessage.model,
+        promptTokens,
+        completionTokens,
+      });
+    }
+    await balanceReservations.release();
+
+    if (userMessagePromise) {
+      await userMessagePromise;
+    }
+
+    if (
+      opts.isCompaction !== true &&
+      this.contextMeta?.calibrationRatio > 0 &&
+      this.contextMeta.calibrationRatio !== 1 &&
+      userMessage.tokenCount > 0
+    ) {
+      const calibrated = Math.round(userMessage.tokenCount * this.contextMeta.calibrationRatio);
+      if (calibrated !== userMessage.tokenCount) {
+        logger.debug('[BaseClient] Calibrated user message tokenCount', {
+          messageId: userMessage.messageId,
+          raw: userMessage.tokenCount,
+          calibrated,
+          ratio: this.contextMeta.calibrationRatio,
+        });
+        userMessage.tokenCount = calibrated;
+        await this.updateMessageInDatabase({
+          messageId: userMessage.messageId,
+          tokenCount: calibrated,
+        });
+      }
+    }
+
+    if (this.artifactPromises) {
+      responseMessage.attachments = (await Promise.all(this.artifactPromises)).filter((a) => a);
+    }
+
+    if (this.options.attachments) {
+      try {
+        saveOptions.files = this.options.attachments.map((attachments) => attachments.file_id);
+      } catch (error) {
+        logger.error('[BaseClient] Error mapping attachments for conversation', error);
+      }
+    }
+
+    if (this.contextMeta) {
+      responseMessage.contextMeta = this.contextMeta;
+    }
+
+    /** Resumable generation controllers must win the generation's terminal
+     * CAS before this outcome-defining `unfinished:false` write can begin.
+     * The hook is deliberately narrow: ordinary clients omit it, and `false`
+     * means another terminal owner (for example Stop) already won, so this
+     * stale completion must return without writing the response row. */
+    if (typeof opts.beforeResponsePersistence === 'function') {
+      const ownsTerminalPersistence = await opts.beforeResponsePersistence(responseMessage);
+      if (ownsTerminalPersistence === false) {
+        responseMessage.databasePromise = Promise.resolve({ persistenceSkipped: true });
+        return responseMessage;
+      }
+    }
+
+    responseMessage.databasePromise = this.saveMessageToDatabase(
+      responseMessage,
+      saveOptions,
+      user,
+    );
+    this.savedMessageIds.add(responseMessage.messageId);
+    return responseMessage;
   }
 
   async loadHistory(conversationId, parentMessageId = null) {
@@ -1210,6 +1300,9 @@ class BaseClient {
     }
 
     const messages = (await db.getMessages({ conversationId, user: this.user })) ?? [];
+    /** A client that reads beyond the walk below (which stops at a checkpoint
+     *  summary) receives every row here; the rest keep nothing. */
+    this.onHistoryLoaded?.(messages);
 
     if (messages.length === 0) {
       return [];
@@ -1225,46 +1318,48 @@ class BaseClient {
       parentMessageId,
       mapMethod,
     });
+    if (this.shouldSummarize) {
+      for (let i = _messages.length - 1; i >= 0; i--) {
+        const msg = _messages[i];
+        if (!msg) {
+          continue;
+        }
 
-    _messages = await this.addPreviousAttachments(_messages);
+        const summaryBlock = findCheckpointSummaryPart(msg.content);
+        if (summaryBlock) {
+          this.previous_summary = {
+            ...msg,
+            summary: getSummaryPartText(summaryBlock),
+            summaryTokenCount: summaryBlock.tokenCount,
+          };
+          break;
+        }
 
-    if (!this.shouldSummarize) {
-      return _messages;
-    }
-
-    for (let i = _messages.length - 1; i >= 0; i--) {
-      const msg = _messages[i];
-      if (!msg) {
-        continue;
+        if (msg.summary) {
+          this.previous_summary = msg;
+          break;
+        }
       }
 
-      const summaryBlock = BaseClient.findSummaryContentBlock(msg);
-      if (summaryBlock) {
-        this.previous_summary = {
-          ...msg,
-          summary: BaseClient.getSummaryText(summaryBlock),
-          summaryTokenCount: summaryBlock.tokenCount,
-        };
-        break;
-      }
-
-      if (msg.summary) {
-        this.previous_summary = msg;
-        break;
-      }
-    }
-
-    if (this.previous_summary) {
-      const { messageId, summary, tokenCount, summaryTokenCount } = this.previous_summary;
-      logger.debug('[BaseClient] Previous summary:', {
-        messageId,
-        summary,
-        tokenCount,
-        summaryTokenCount,
+      _messages = this.constructor.getMessagesForConversation({
+        messages,
+        parentMessageId,
+        mapMethod,
+        summary: true,
       });
+
+      if (this.previous_summary) {
+        const { messageId, summary, tokenCount, summaryTokenCount } = this.previous_summary;
+        logger.debug('[BaseClient] Previous summary:', {
+          messageId,
+          summary,
+          tokenCount,
+          summaryTokenCount,
+        });
+      }
     }
 
-    return _messages;
+    return this.addPreviousAttachments(_messages);
   }
 
   /**
@@ -1288,13 +1383,11 @@ class BaseClient {
     }
 
     const hasAddedConvo = options?.req?.body?.addedConvo != null;
-    const reqCtx = {
-      userId: options?.req?.user?.id,
-      isTemporary:
-        options?.req?._agentEventBindingRetention?.isTemporary ?? options?.req?.body?.isTemporary,
-      expiredAt: options?.req?._agentEventBindingRetention?.expiredAt,
-      interfaceConfig: options?.req?.config?.interfaceConfig,
-    };
+    const req = options?.req;
+    if (needsRetentionConversation(req)) {
+      req.resolvedConversation = await db.getConvo(req.user.id, message.conversationId);
+    }
+    const reqCtx = getConversationWriteContext(req);
     const savedMessage = await db.saveMessage(
       reqCtx,
       {
@@ -1311,69 +1404,41 @@ class BaseClient {
       return { message: savedMessage };
     }
 
-    const fieldsToKeep = {
-      conversationId: message.conversationId,
-      endpoint: options.endpoint,
-      endpointType: options.endpointType,
-      ...endpointOptions,
-    };
-    const conversationCreatedAt = options?.req?.conversationCreatedAt;
-    const createdAtOnInsert =
-      conversationCreatedAt != null ? new Date(conversationCreatedAt) : undefined;
-    const validCreatedAtOnInsert =
-      createdAtOnInsert && !Number.isNaN(createdAtOnInsert.getTime())
-        ? createdAtOnInsert
-        : undefined;
-
-    const req = options?.req;
-    const skippedExistingConvoLookup = this.fetchedConvo === true;
-    const hasResolvedConversation =
-      req != null && Object.prototype.hasOwnProperty.call(req, 'resolvedConversation');
-    let existingConvo = null;
-    if (!skippedExistingConvoLookup && hasResolvedConversation) {
-      existingConvo = req.resolvedConversation;
-    } else if (!skippedExistingConvoLookup) {
-      existingConvo = await db.getConvo(req?.user?.id, message.conversationId);
-    }
-    if (hasResolvedConversation) {
-      delete req.resolvedConversation;
-    }
-    const shouldSetCreatedAtOnInsert = !skippedExistingConvoLookup && existingConvo == null;
-
-    const unsetFields = {};
-    const exceptions = new Set(['spec', 'iconURL']);
-    const hasNonEphemeralAgent =
-      isAgentsEndpoint(options.endpoint) &&
-      endpointOptions?.agent_id &&
-      !isEphemeralAgentId(endpointOptions.agent_id);
-    if (hasNonEphemeralAgent) {
-      exceptions.add('model');
-    }
-    if (existingConvo != null) {
-      this.fetchedConvo = true;
-      for (const key in existingConvo) {
-        if (!key) {
-          continue;
-        }
-        if (excludedKeys.has(key) && !exceptions.has(key)) {
-          continue;
-        }
-
-        if (endpointOptions?.[key] === undefined) {
-          unsetFields[key] = 1;
-        }
-      }
-    }
-
-    const conversation = await db.saveConvo(reqCtx, fieldsToKeep, {
-      context: 'api/app/clients/BaseClient.js - saveMessageToDatabase #saveConvo',
-      unsetFields,
-      noUpsert: req?._agentEventBindingParentConversationId != null,
-      createdAtOnInsert: shouldSetCreatedAtOnInsert ? validCreatedAtOnInsert : undefined,
-      ...(savedMessage?._id != null ? { appendMessageIds: [savedMessage._id] } : {}),
+    const { conversation, initialized } = await saveTurnConversation(db, {
+      ...this.getTurnConversationFields(
+        options,
+        message.conversationId,
+        endpointOptions,
+        'api/app/clients/BaseClient.js - saveMessageToDatabase #saveConvo',
+      ),
+      ctx: reqCtx,
+      initialized: this.fetchedConvo === true,
+      savedMessageId: savedMessage?._id,
     });
+    if (initialized) {
+      this.fetchedConvo = true;
+    }
 
     return { message: savedMessage, conversation };
+  }
+
+  /**
+   * The conversation fields a turn's writes share.
+   * @param {Object} options - The client options snapshot.
+   * @param {string} conversationId
+   * @param {Partial<TConversation>} endpointOptions
+   * @param {string} context - Names the write in the save log.
+   */
+  getTurnConversationFields(options, conversationId, endpointOptions, context) {
+    return {
+      req: options.req,
+      conversationId,
+      endpoint: options.endpoint,
+      endpointType: options.endpointType,
+      endpointOptions,
+      agentId: options.agent?.id,
+      context,
+    };
   }
 
   /**
@@ -1382,34 +1447,6 @@ class BaseClient {
    */
   async updateMessageInDatabase(message) {
     await db.updateMessage(this.options?.req?.user?.id, message);
-  }
-
-  /** Extracts text from a summary block (handles both legacy `text` field and new `content` array format). */
-  static getSummaryText(summaryBlock) {
-    if (Array.isArray(summaryBlock.content)) {
-      return summaryBlock.content.map((b) => b.text ?? '').join('');
-    }
-    if (typeof summaryBlock.content === 'string') {
-      return summaryBlock.content;
-    }
-    return summaryBlock.text ?? '';
-  }
-
-  /** Finds the last summary content block in a message's content array (last-summary-wins). */
-  static findSummaryContentBlock(message) {
-    if (!Array.isArray(message?.content)) {
-      return null;
-    }
-    let lastSummary = null;
-    for (const part of message.content) {
-      if (
-        part?.type === ContentTypes.SUMMARY &&
-        BaseClient.getSummaryText(part).trim().length > 0
-      ) {
-        lastSummary = part;
-      }
-    }
-    return lastSummary;
   }
 
   /**
@@ -1473,9 +1510,9 @@ class BaseClient {
       let resolved = message;
       let hasSummary = false;
       if (summary) {
-        const summaryBlock = BaseClient.findSummaryContentBlock(message);
+        const summaryBlock = findCheckpointSummaryPart(message.content);
         if (summaryBlock) {
-          const summaryText = BaseClient.getSummaryText(summaryBlock);
+          const summaryText = getSummaryPartText(summaryBlock);
           resolved = {
             ...message,
             role: 'system',
@@ -1690,6 +1727,16 @@ class BaseClient {
     return await this.sendCompletion(payload, opts);
   }
 
+  /** Whether this turn talks to the Responses API, which is what lets Azure carry a
+   *  document natively. A saved agent holds it in its parameters and a plain conversation
+   *  in its model options, and both readers of it have been wrong by consulting one. */
+  usesResponsesApi() {
+    return resolveUseResponsesApi(
+      this.options.agent?.model_parameters?.useResponsesApi,
+      this.modelOptions?.useResponsesApi,
+    );
+  }
+
   async addDocuments(message, attachments) {
     const documentResult = await encodeAndFormatDocuments(
       this.options.req,
@@ -1697,7 +1744,7 @@ class BaseClient {
       {
         provider: this.options.agent?.provider ?? this.options.endpoint,
         endpoint: this.options.agent?.endpoint ?? this.options.endpoint,
-        useResponsesApi: this.options.agent?.model_parameters?.useResponsesApi,
+        useResponsesApi: this.usesResponsesApi(),
         model: this.modelOptions?.model ?? this.model,
       },
       getStrategyFunctions,
@@ -1746,9 +1793,10 @@ class BaseClient {
    * @param {MongoFile[]} attachments - Array of file attachments
    * @returns {Promise<void>}
    */
-  async addFileContextToMessage(message, attachments) {
+  async addFileContextToMessage(message, attachments, fileConsumers) {
+    const textAttachments = this.getTextContextAttachments(attachments, fileConsumers);
     const fileContext = await extractFileContext({
-      attachments,
+      attachments: textAttachments,
       req: this.options?.req,
       tokenCountFn: (text) => countTokens(text),
     });
@@ -1758,7 +1806,29 @@ class BaseClient {
     }
   }
 
-  async processAttachments(message, attachments) {
+  getTextContextAttachments(attachments, fileConsumers) {
+    return attachments.filter((file) => {
+      const deliveryPath = this.getAttachmentDeliveryPath(file, fileConsumers);
+      /* Records predating delivery paths keep legacy extraction. Current routing is
+       * authoritative for inferred uploads, so native provider bytes are not also
+       * injected as extracted text after a provider handoff. */
+      return deliveryPath == null || deliveryPath === 'text';
+    });
+  }
+
+  /** The turn's view of stored records, applied before admission at every load. */
+  resolveTurnAttachments(files, fileConsumers = this.options.agent?.fileConsumers) {
+    return applyTurnDelivery(files, {
+      routing: this.options.agent?.deliveryRouting,
+      consumers: fileConsumers,
+    });
+  }
+
+  getAttachmentDeliveryPath(file, fileConsumers = this.options.agent?.fileConsumers) {
+    return resolveTurnLLMDeliveryPath(this.options.agent?.deliveryRouting, file, fileConsumers);
+  }
+
+  async processAttachments(message, attachments, fileConsumers) {
     const categorizedAttachments = {
       images: [],
       videos: [],
@@ -1767,20 +1837,15 @@ class BaseClient {
     };
 
     const allFiles = [];
-
     const provider = this.options.agent?.provider ?? this.options.endpoint;
     const isBedrock = provider === EModelEndpoint.bedrock;
+    const deliveryRouting = this.options.agent?.deliveryRouting;
 
-    if (!this._mergedFileConfig) {
-      this._mergedFileConfig = mergeFileConfig(this.options.req?.config?.fileConfig);
-      const endpoint = this.options.agent?.endpoint ?? this.options.endpoint;
-      this._endpointFileConfig = getEndpointFileConfig({
-        fileConfig: this._mergedFileConfig,
-        endpoint,
-        endpointType: this.options.endpointType,
-      });
-    }
-
+    /* The stored path records what upload time inferred from the endpoint it saw, and this
+     * turn may be running somewhere else: audio stored as `provider` under Google reaches
+     * an encoder that emits nothing for OpenAI, delivering neither media nor text. An
+     * explicit chooser decision is the user's and survives, and a record predating the
+     * field keeps its legacy handling. */
     for (const file of attachments) {
       /** @type {FileSources} */
       const source = file.source ?? FileSources.local;
@@ -1788,12 +1853,15 @@ class BaseClient {
         allFiles.push(file);
         continue;
       }
-      if (
-        file.embedded === true ||
-        file.metadata?.codeEnvRef != null ||
-        file.metadata?.codeEnvRefs != null ||
-        file.metadata?.fileIdentifier != null
-      ) {
+      const deliveryPath = this.getAttachmentDeliveryPath(file, fileConsumers);
+      if (deliveryPath === 'text' || deliveryPath === 'none') {
+        allFiles.push(file);
+        continue;
+      }
+      /* An explicit `provider` path is authoritative: lazy provisioning stamps
+       * `embedded`/`codeEnvRef` on files that are still meant for the model, so the
+       * legacy tool-provisioning exclusion only applies to records without one. */
+      if (deliveryPath !== 'provider' && isToolOwnedAttachment(file)) {
         allFiles.push(file);
         continue;
       }
@@ -1814,9 +1882,11 @@ class BaseClient {
         allFiles.push(file);
       } else if (
         file.type &&
-        this._mergedFileConfig &&
-        this._endpointFileConfig?.supportedMimeTypes &&
-        this._mergedFileConfig.checkType(file.type, this._endpointFileConfig.supportedMimeTypes)
+        deliveryRouting?.endpointConfig.supportedMimeTypes &&
+        deliveryRouting.fileConfig.checkType(
+          file.type,
+          deliveryRouting.endpointConfig.supportedMimeTypes,
+        )
       ) {
         categorizedAttachments.documents.push(file);
         allFiles.push(file);
@@ -1878,18 +1948,69 @@ class BaseClient {
     const historicalFileState = collectModelBoundHistoricalFileIdState(_messages);
     this.modelBoundHistoricalFileIdsOverflowed ||= historicalFileState.overflowed;
     const authorizedFilesById = new Map();
-    const files = await getOwnerHistoricalFiles(
-      historicalFileState.fileIds,
-      this.options.req?.user,
+    const files = this.resolveTurnAttachments(
+      await getOwnerHistoricalFiles(historicalFileState.fileIds, this.options.req?.user),
     );
+    const nonSteerReplayFileIds = collectModelBoundHistoricalFileIdState(
+      _messages.map((message) => ({
+        files: message.files,
+        content: Array.isArray(message.content)
+          ? message.content.filter((part) => part?.type !== ContentTypes.STEER)
+          : message.content,
+      })),
+    ).fileIds.filter((fileId) => !contextSeen.has(fileId));
+    const steerReplayFileIds = [];
+    for (const message of _messages) {
+      if (!Array.isArray(message?.content)) {
+        continue;
+      }
+      for (const part of message.content) {
+        if (part?.type !== ContentTypes.STEER || !Array.isArray(part.files)) {
+          continue;
+        }
+        for (const file of part.files) {
+          if (typeof file?.file_id === 'string' && file.file_id.length > 0) {
+            steerReplayFileIds.push(file.file_id);
+          }
+        }
+      }
+    }
     for (const file of files) {
       if (file?.file_id) {
         authorizedFilesById.set(file.file_id, file);
       }
     }
+    let admittedHistoricalFileIds;
+    if (typeof this.assertHistoricalAttachmentLimits === 'function') {
+      const admittedHistoricalFiles = await this.assertHistoricalAttachmentLimits(
+        [...nonSteerReplayFileIds, ...steerReplayFileIds]
+          .map((fileId) => authorizedFilesById.get(fileId))
+          .filter((file) => file != null && isModelBoundAttachmentFile(file)),
+      );
+      admittedHistoricalFileIds = new Set(
+        (admittedHistoricalFiles ?? []).map((file) => file?.file_id).filter(Boolean),
+      );
+    }
+    this.modelBoundHistoricalSteerFiles = steerReplayFileIds
+      .map((fileId) => authorizedFilesById.get(fileId))
+      .filter(
+        (file) =>
+          file != null &&
+          isModelBoundAttachmentFile(file) &&
+          (!admittedHistoricalFileIds || admittedHistoricalFileIds.has(file.file_id)),
+      );
     /** Owner-scoped docs for THIS turn, including steer-part refs — the steer
      *  replay stamp consumes this instead of issuing a second query. */
     this.authorizedHistoricalFiles = authorizedFilesById;
+    this.authorizedHistoricalReplayFiles = new Map(
+      files
+        .filter(
+          (file) =>
+            file?.file_id &&
+            (!admittedHistoricalFileIds || admittedHistoricalFileIds.has(file.file_id)),
+        )
+        .map((file) => [file.file_id, file]),
+    );
 
     /**
      *
@@ -1910,7 +2031,10 @@ class BaseClient {
             continue;
           }
           const authorizedFile = authorizedFilesById.get(file.file_id);
-          if (authorizedFile) {
+          if (
+            authorizedFile &&
+            (!admittedHistoricalFileIds || admittedHistoricalFileIds.has(file.file_id))
+          ) {
             contextFiles.push(authorizedFile);
             contextSeen.add(file.file_id);
           }
@@ -1941,12 +2065,17 @@ class BaseClient {
         return message;
       }
 
-      await Promise.all([
+      const [, processedFiles] = await Promise.all([
         this.addFileContextToMessage(message, contextFiles),
         this.processAttachments(message, contextFiles),
       ]);
 
-      this.message_file_map[message.messageId] = contextFiles;
+      const processedFileIds = new Set(
+        (processedFiles ?? []).map((file) => file?.file_id).filter(Boolean),
+      );
+      this.message_file_map[message.messageId] = contextFiles.filter(
+        (file) => processedFileIds.has(file?.file_id) && isModelBoundAttachmentFile(file),
+      );
       return message;
     };
 
