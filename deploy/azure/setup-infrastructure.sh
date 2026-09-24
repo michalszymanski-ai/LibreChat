@@ -85,6 +85,7 @@ az aks create \
   --node-os-upgrade-channel NodeImage \
   --no-ssh-key \
   --network-plugin azure \
+  --network-policy calico \
   --output none
 
 # ── 3b. Static ingress IP ────────────────────────────────────────────────

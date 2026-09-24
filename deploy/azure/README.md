@@ -32,7 +32,12 @@ ACR, storage and Key Vault were moved with `az resource move`.
 
 LibreChat v0.8.8-rc4 and later refuse to start with the retired default
 `JWT_SECRET`/`JWT_REFRESH_SECRET`, so both are unique values in the
-`billechat-librechat-env` Secret; rotating them signs every user out once.
+`billechat-librechat-env` Secret; rotating them signs every user out once. `CREDS_KEY`/`CREDS_IV` encrypt stored
+credentials (MCP OAuth tokens, user keys, action secrets); rotate them only with
+`deploy/azure/credentials/`, which re-encrypts every stored value first (see `job.yaml`).
+
+Calico enforces the NetworkPolicies shipped by codeapi and the Bitnami charts, e.g. the
+sandbox tool-call server has no direct internet egress.
 
 The single node is the floor for this workload: the six Azure Disk PVCs rule
 out 2-vCPU sizes (4 data disks max), and codeapi needs nested virtualization
