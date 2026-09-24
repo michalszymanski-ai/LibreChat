@@ -18,7 +18,7 @@ set -euo pipefail
 #=============================================================================
 
 # ── Configuration ──────────────────────────────────────────────────────────
-SUBSCRIPTION="${SUBSCRIPTION:-BL-TRANSFORMATION-POC}"
+SUBSCRIPTION="${SUBSCRIPTION:-Subscription - Solutions Partner - Modern Work}"
 RESOURCE_GROUP="${RESOURCE_GROUP:-billechat-rg}"
 LOCATION="${LOCATION:-swedencentral}"
 AKS_CLUSTER="${AKS_CLUSTER:-billechat-aks}"
@@ -26,8 +26,9 @@ ACR_NAME="${ACR_NAME:-billechatacr}"
 INGRESS_PIP="${INGRESS_PIP:-billechat-ingress-pip}"
 # One node is enough for the workload; the 6 Azure Disk PVCs rule out 2-vCPU
 # sizes (4 data disks max) and codeapi needs nested virtualization (/dev/kvm).
+# The subscription only has v6 quota (10 vCPU: one node plus an upgrade surge).
 NODE_COUNT="${NODE_COUNT:-1}"
-NODE_VM_SIZE="${NODE_VM_SIZE:-Standard_D4as_v5}"
+NODE_VM_SIZE="${NODE_VM_SIZE:-Standard_D4s_v6}"
 NODE_OSDISK_GB="${NODE_OSDISK_GB:-64}"
 MAX_PODS="${MAX_PODS:-110}"
 K8S_VERSION="${K8S_VERSION:-1.34}"

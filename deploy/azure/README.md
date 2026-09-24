@@ -5,7 +5,7 @@ Deploy LibreChat (billechat branch) to Azure Kubernetes Service.
 ## Architecture
 
 ```
-Internet → billechat.billennium.com (A → 9.223.181.253, static IP billechat-ingress-pip)
+Internet → billechat.billennium.com (A → 4.223.170.166, static IP billechat-ingress-pip)
          → Azure Load Balancer
          → NGINX Ingress (TLS via Let's Encrypt)
          → LibreChat Pod (AKS)
@@ -20,13 +20,13 @@ Internet → billechat.billennium.com (A → 9.223.181.253, static IP billechat-
 
 | | |
 |---|---|
-| Subscription | `BL-TRANSFORMATION-POC` (`b9ac4560-bf0d-41cb-b3e7-1a27bd71ae5d`) |
+| Subscription | `Subscription - Solutions Partner - Modern Work` (`c910123c-b2f4-4707-9b6c-edfd9f111dd2`), billed to the Billennium MCA *PartnerBenefits* invoice section |
 | Resource group | `billechat-rg` (swedencentral): AKS, ACR `billechatacr`, storage `stbillechatfiles`, Key Vault `kv-billechat`, ingress IP |
-| AKS | `billechat-aks`, k8s 1.34, one `Standard_D4as_v5` node (pool `system`, max 110 pods) |
-| Ingress IP | `9.223.181.253` (static, survives ingress/cluster rebuilds) |
-| Outbound IP | `57.174.174.79` (allowlist this on external services) |
+| AKS | `billechat-aks`, k8s 1.34, one `Standard_D4s_v6` node (pool `system`, max 110 pods, Calico) |
+| Ingress IP | `4.223.170.166` (static, survives ingress/cluster rebuilds) |
+| Outbound IP | `57.174.68.67` (allowlist this on external services) |
 
-Moved from `BL-AI_DATA_POC` in September 2026. AKS clusters can't change
+Moved from `BL-AI_DATA_POC` to `Subscription - Solutions Partner - Modern Work` in September 2026. AKS clusters can't change
 subscription, so the cluster was rebuilt and its disks copied via snapshots;
 ACR, storage and Key Vault were moved with `az resource move`.
 
@@ -61,7 +61,7 @@ chmod +x deploy/azure/setup-infrastructure.sh
 This creates:
 - Resource Group (`billechat-rg`)
 - Azure Container Registry (`billechatacr`)
-- AKS cluster (`billechat-aks`, 1x Standard_D4as_v5)
+- AKS cluster (`billechat-aks`, 1x Standard_D4s_v6)
 - Static public IP for the ingress (`billechat-ingress-pip`)
 - NGINX Ingress Controller
 - cert-manager with Let's Encrypt
@@ -78,7 +78,7 @@ MongoDB, Redis, PgVector, MinIO and the RAG API are pulled from
 
 ### 2. Configure DNS
 
-Point an A record for `billechat.billennium.com` to the static ingress IP printed by the setup script (currently `9.223.181.253`).
+Point an A record for `billechat.billennium.com` to the static ingress IP printed by the setup script (currently `4.223.170.166`).
 
 ### 3. Set Up GitHub Actions Secrets
 

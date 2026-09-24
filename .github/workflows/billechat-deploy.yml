@@ -16,10 +16,10 @@ permissions:
 
 env:
   ACR_NAME: billechatacr
-  # BL-TRANSFORMATION-POC. Pinned here because azure/login ignores `creds` when
+  # Subscription - Solutions Partner - Modern Work. Pinned here because azure/login ignores `creds` when
   # a subscription-id input is also set, and AZURE_CREDENTIALS still names the
   # subscription the cluster was created in.
-  AZURE_SUBSCRIPTION_ID: b9ac4560-bf0d-41cb-b3e7-1a27bd71ae5d
+  AZURE_SUBSCRIPTION_ID: c910123c-b2f4-4707-9b6c-edfd9f111dd2
   AKS_CLUSTER: billechat-aks
   RESOURCE_GROUP: billechat-rg
   NAMESPACE: billechat

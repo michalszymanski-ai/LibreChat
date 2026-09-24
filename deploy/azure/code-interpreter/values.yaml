@@ -9,7 +9,7 @@
 # (see deploy/azure/README.md) or from the pre-created `codeapi-jwt-verifier`
 # secret for the LibreChat verifier key.
 #
-# Sizing note: the cluster is a single Standard_D4as_v5 node (3860m allocatable
+# Sizing note: the cluster is a single Standard_D4s_v6 node (3860m allocatable
 # CPU) shared with LibreChat, Mongo, Postgres, Meilisearch and two MCP servers,
 # so every component runs a single replica and CPU requests track observed idle
 # usage while limits allow bursts.
@@ -70,7 +70,7 @@ workerSandbox:
     repository: billechatacr.azurecr.io/codeapi-sandbox-runner
     tag: latest
     pullPolicy: IfNotPresent
-  # Nodes are Standard_D4as_v5 and expose /dev/kvm (AMD svm), so the sandbox runs
+  # Nodes are Standard_D4s_v6 and expose /dev/kvm (Intel vmx), so the sandbox runs
   # under its own guest kernel with NsJail inside rather than sharing the host.
   kvmEnabled: true
   # A hostPath mount leaves the device cgroup closed for non-privileged

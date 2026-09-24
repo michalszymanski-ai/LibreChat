@@ -18,7 +18,7 @@ set -euo pipefail
 #=============================================================================
 
 ACR_NAME="${ACR_NAME:-billechatacr}"
-SUBSCRIPTION="${SUBSCRIPTION:-BL-TRANSFORMATION-POC}"
+SUBSCRIPTION="${SUBSCRIPTION:-Subscription - Solutions Partner - Modern Work}"
 
 IMAGES=(
   "docker.io/bitnami/mongodb@sha256:e46cffb6627482d0c1e1769746d938c0b926e8ca0a0ddea55c6b58c2bae3eb26 mirror/bitnami-mongodb:8.3.11"
