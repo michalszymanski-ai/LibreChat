@@ -52,6 +52,11 @@ librechat:
     AZURE_CONTAINER_NAME: "files"
     AZURE_STORAGE_PUBLIC_ACCESS: "false"
 
+    # Schedules — one LibreChat process (replicaCount 1, Recreate, no HPA) and no
+    # Redis, so assert single-process to let the schedule engine arm. Scaling past
+    # one replica makes this false: drop it and enable USE_REDIS_STREAMS instead.
+    SCHEDULES_SINGLE_PROCESS: "true"
+
     # Anthropic via Azure AI Foundry (deployment names == model ids on the Foundry)
     ANTHROPIC_REVERSE_PROXY: "https://micha-mm146vwy-swedencentral.services.ai.azure.com/anthropic"
     ANTHROPIC_MODELS: "claude-opus-5,claude-fable-5,claude-opus-4-8,claude-opus-4-7"
