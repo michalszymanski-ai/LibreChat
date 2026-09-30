@@ -93,7 +93,7 @@ librechat:
     OPENID_SCOPE: "openid profile email offline_access api://f0aa5392-50f1-4319-9c10-4c817490bfd9/access_as_user"
     OPENID_CALLBACK_URL: "/oauth/openid/callback"
     OPENID_REDIRECT_URI: "https://billechat.billennium.com/oauth/openid/callback"
-    OPENID_EMAIL_CLAIM: "upn"
+    OPENID_EMAIL_CLAIM: "email"
     OPENID_BUTTON_LABEL: "Sign in with Billennium"
     OPENID_REUSE_TOKENS: "true"
 
