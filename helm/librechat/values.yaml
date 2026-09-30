@@ -116,6 +116,15 @@ librechat:
     accessModes: ReadWriteOnce
     # storageClassName: 
 
+  # Volume for /app/uploads: files stored with `fileStrategy: local` and the temp
+  # directory uploads pass through. Without it they live on the container filesystem
+  # and are lost whenever the pod is replaced.
+  uploadsVolume:
+    enabled: false
+    size: 10Gi
+    accessModes: ReadWriteOnce
+    # storageClassName:
+
 # only lite RAG is supported
 librechat-rag-api:
   enabled: false

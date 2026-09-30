@@ -192,6 +192,13 @@ librechat:
     size: 10Gi
     accessModes: ReadWriteOnce
 
+  # Uploads go to Azure Blob, but /app/uploads still holds the temp directory and
+  # any file a strategy writes locally; keep it across pod replacement.
+  uploadsVolume:
+    enabled: true
+    size: 10Gi
+    accessModes: ReadWriteOnce
+
 # Image
 imagePullSecrets: []
 

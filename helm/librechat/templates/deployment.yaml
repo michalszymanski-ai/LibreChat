@@ -92,6 +92,10 @@ spec:
           - name: image-volume
             mountPath: "/app/client/public/images"
           {{- end }}
+          {{- if .Values.librechat.uploadsVolume.enabled }}
+          - name: uploads-volume
+            mountPath: "/app/uploads"
+          {{- end }}
           {{- if .Values.volumeMounts }}
           {{- toYaml .Values.volumeMounts | nindent 10 }}
           {{- end }}
@@ -121,6 +125,11 @@ spec:
       - name: image-volume
         persistentVolumeClaim:
           claimName: {{ include "librechat.fullname" $ }}-images
+      {{- end }}
+      {{- if .Values.librechat.uploadsVolume.enabled }}
+      - name: uploads-volume
+        persistentVolumeClaim:
+          claimName: {{ include "librechat.fullname" $ }}-uploads
       {{- end }}
       {{- if .Values.volumes }}
       {{- toYaml .Values.volumes | nindent 6 }}
