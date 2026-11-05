@@ -24,6 +24,7 @@ LOCATION="${LOCATION:-swedencentral}"
 AKS_CLUSTER="${AKS_CLUSTER:-billechat-aks}"
 ACR_NAME="${ACR_NAME:-billechatacr}"
 INGRESS_PIP="${INGRESS_PIP:-billechat-ingress-pip}"
+INGRESS_IMAGE_TAG="${INGRESS_IMAGE_TAG:-v1.15.1-curl8.23.0}"
 # One node is enough for the workload; the 6 Azure Disk PVCs rule out 2-vCPU
 # sizes (4 data disks max) and codeapi needs nested virtualization (/dev/kvm).
 # The subscription only has v6 quota (10 vCPU: one node plus an upgrade surge).
@@ -125,11 +126,24 @@ echo "▸ Installing NGINX Ingress Controller..."
 helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx 2>/dev/null || true
 helm repo update
 
+# ingress-nginx is archived upstream, so the controller runs a rebuild of
+# v1.15.1 with current Alpine curl (see deploy/azure/ingress-nginx/Dockerfile).
+if ! az acr repository show --name "${ACR_NAME}" --image "ingress-nginx-controller:${INGRESS_IMAGE_TAG}" --output none 2>/dev/null; then
+  az acr build --registry "${ACR_NAME}" --platform linux/amd64 \
+    --image "ingress-nginx-controller:${INGRESS_IMAGE_TAG}" deploy/azure/ingress-nginx
+fi
+INGRESS_IMAGE_DIGEST=$(az acr repository show --name "${ACR_NAME}" \
+  --image "ingress-nginx-controller:${INGRESS_IMAGE_TAG}" --query digest -o tsv)
+
 helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
   --namespace ingress-nginx \
   --create-namespace \
   --version 4.15.1 \
   --set controller.replicaCount=2 \
+  --set controller.image.registry="${ACR_LOGIN_SERVER}" \
+  --set controller.image.image=ingress-nginx-controller \
+  --set controller.image.tag="${INGRESS_IMAGE_TAG}" \
+  --set controller.image.digest="${INGRESS_IMAGE_DIGEST}" \
   --set controller.service.annotations."service\.beta\.kubernetes\.io/azure-load-balancer-health-probe-request-path"=/healthz \
   --set controller.service.annotations."service\.beta\.kubernetes\.io/azure-load-balancer-resource-group"="${RESOURCE_GROUP}" \
   --set controller.service.annotations."service\.beta\.kubernetes\.io/azure-pip-name"="${INGRESS_PIP}" \

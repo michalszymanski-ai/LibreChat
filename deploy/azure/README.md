@@ -63,7 +63,9 @@ This creates:
 - Azure Container Registry (`billechatacr`)
 - AKS cluster (`billechat-aks`, 1x Standard_D4s_v6)
 - Static public IP for the ingress (`billechat-ingress-pip`)
-- NGINX Ingress Controller
+- NGINX Ingress Controller, from a patched v1.15.1 image built into ACR
+  (`deploy/azure/ingress-nginx/Dockerfile`; upstream ingress-nginx is archived
+  and ships no more OS fixes)
 - cert-manager with Let's Encrypt
 
 Then mirror the pinned third-party images into ACR:
