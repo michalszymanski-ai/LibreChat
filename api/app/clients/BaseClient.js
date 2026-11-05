@@ -26,6 +26,7 @@ const {
   withBalanceReservations,
   findCheckpointSummaryPart,
   getSummaryPartText,
+  resolveCheckpointMessage,
   runAfterSeed,
   saveTurnConversation,
   seedTurnConversation,
@@ -1458,6 +1459,7 @@ class BaseClient {
    * - The message's 'role' is set to 'system'.
    * - The message's 'text' is set to its 'summary'.
    * - If the message has a 'summaryTokenCount', the message's 'tokenCount' is set to 'summaryTokenCount'.
+   * - A message with a summary content block keeps its content from that block on, for the SDK formatter to promote.
    * The traversal stops at the message with the 'summary' property.
    *
    * Each message object should have an 'id' or 'messageId' property and may have a 'parentMessageId' property.
@@ -1507,35 +1509,13 @@ class BaseClient {
         break;
       }
 
-      let resolved = message;
-      let hasSummary = false;
-      if (summary) {
-        const summaryBlock = findCheckpointSummaryPart(message.content);
-        if (summaryBlock) {
-          const summaryText = getSummaryPartText(summaryBlock);
-          resolved = {
-            ...message,
-            role: 'system',
-            content: [{ type: ContentTypes.TEXT, text: summaryText }],
-            tokenCount: summaryBlock.tokenCount,
-          };
-          hasSummary = true;
-        } else if (message.summary) {
-          resolved = {
-            ...message,
-            role: 'system',
-            content: [{ type: ContentTypes.TEXT, text: message.summary }],
-            tokenCount: message.summaryTokenCount ?? message.tokenCount,
-          };
-          hasSummary = true;
-        }
-      }
-
+      const checkpoint = summary ? resolveCheckpointMessage(message) : null;
+      const resolved = checkpoint ?? message;
       const shouldMap = mapMethod != null && (mapCondition != null ? mapCondition(resolved) : true);
       const processedMessage = shouldMap ? mapMethod(resolved) : resolved;
       orderedMessages.push(processedMessage);
 
-      if (hasSummary) {
+      if (checkpoint) {
         break;
       }
 
